@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import threading
+import uuid
+import zipfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+from PIL import Image, ImageOps, UnidentifiedImageError
+import pypdfium2 as pdfium
+
+from demo import POEMS, artwork, artwork_note
+
+ALLOWED = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.pdf'}
+MAX_FILE = 200 * 1024 * 1024
+PDF_LOCK = threading.Lock()
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def default_data_dir():
+    return Path(os.environ.get('SHIJIAN_DATA_DIR') or (Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'Shijian' / 'library'))
+
+
+def safe_name(value):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', value).strip('. ')[:90] or '无题'
+
+
+class Library:
+    def __init__(self, root: Path, seed=True):
+        self.root = Path(root).resolve()
+        self.lock = threading.RLock()
+        for part in ('originals', 'previews', 'results', 'tmp', 'exports'):
+            (self.root / part).mkdir(parents=True, exist_ok=True)
+        self.db = self.root / 'library.sqlite3'
+        with self.connect() as db:
+            db.executescript('''
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS documents (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, author TEXT DEFAULT '', era TEXT DEFAULT '',
+                    collection TEXT DEFAULT '未分诗集', filename TEXT NOT NULL, source TEXT NOT NULL,
+                    preview TEXT NOT NULL, sha256 TEXT UNIQUE NOT NULL, pages INTEGER DEFAULT 1,
+                    text TEXT DEFAULT '', raw_text TEXT DEFAULT '', notes TEXT DEFAULT '',
+                    status TEXT DEFAULT 'new', favorite INTEGER DEFAULT 0, reviewed INTEGER DEFAULT 0,
+                    demo INTEGER DEFAULT 0, trashed INTEGER DEFAULT 0, error TEXT DEFAULT '',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, document_id TEXT NOT NULL,
+                    text TEXT NOT NULL, title TEXT NOT NULL, author TEXT NOT NULL,
+                    era TEXT NOT NULL, notes TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            ''')
+            # An interrupted process is never misreported as still running.
+            db.execute("UPDATE documents SET status='interrupted',error='上次识别被中断，可重新加入队列。' WHERE status IN ('queued','running')")
+        if seed and not self.setting('seeded', False):
+            self.seed()
+            self.set_setting('seeded', True)
+        if seed and self.setting('artwork_version', 0) < 2:
+            self.migrate_demo_art()
+            self.set_setting('artwork_version', 2)
+
+    @contextmanager
+    def connect(self):
+        with self.lock:
+            db = sqlite3.connect(self.db, timeout=30)
+            db.row_factory = sqlite3.Row
+            try:
+                yield db
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
+    def setting(self, key, default=None):
+        with self.connect() as db:
+            row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        return json.loads(row['value']) if row else default
+
+    def set_setting(self, key, value):
+        with self.connect() as db:
+            db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, json.dumps(value, ensure_ascii=False)))
+
+    def seed(self):
+        for i, (title, author, era, text, collection, motif) in enumerate(POEMS):
+            doc_id = 'demo-' + str(i+1)
+            relative = f'originals/{doc_id}.jpg'
+            image, attribution = artwork(motif)
+            shutil.copyfile(image, self.root / relative)
+            with self.connect() as db:
+                db.execute('''INSERT OR IGNORE INTO documents
+                    (id,title,author,era,collection,filename,source,preview,sha256,text,raw_text,status,favorite,reviewed,demo,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (doc_id, title, author, era, collection, title+'-赏读配图.jpg', relative, relative,
+                     doc_id, text, text, 'done', int(i in (0, 3)), 1, 1, now(), now()))
+                db.execute('INSERT OR IGNORE INTO collections VALUES (?)', (collection,))
+
+    def migrate_demo_art(self):
+        for i, (title, _, _, _, _, key) in enumerate(POEMS):
+            image, attribution = artwork(key)
+            doc_id = 'demo-' + str(i+1)
+            relative = f'originals/{doc_id}.jpg'
+            shutil.copyfile(image, self.root/relative)
+            with self.connect() as db:
+                db.execute('UPDATE documents SET source=?,preview=?,filename=?,notes=? WHERE id=? AND demo=1',
+                           (relative, relative, title+'-赏读配图.jpg', artwork_note(attribution), doc_id))
+
+    def get(self, doc_id):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM documents WHERE id=?', (doc_id,)).fetchone()
+        if not row:
+            raise KeyError('找不到这份诗稿')
+        return dict(row)
+
+    def all(self, include_trash=False):
+        with self.connect() as db:
+            rows = db.execute('SELECT * FROM documents ' + ('' if include_trash else 'WHERE trashed=0 ') + 'ORDER BY created_at DESC,id').fetchall()
+        return [dict(r) for r in rows]
+
+    def update(self, doc_id, **values):
+        allowed = {'title','author','era','collection','text','raw_text','notes','status','favorite','reviewed','trashed','error'}
+        if set(values) - allowed:
+            raise ValueError('不支持的字段')
+        values['updated_at'] = now()
+        with self.connect() as db:
+            db.execute('UPDATE documents SET ' + ','.join(k+'=?' for k in values) + ' WHERE id=?', (*values.values(), doc_id))
+
+    def edit(self, doc_id, values):
+        with self.connect() as db:
+            old = self.get(doc_id)
+            if old['status'] in ('running','queued'):
+                raise ValueError('正在识别，请等待完成后校对。')
+            if any(k in values and values[k] != old[k] for k in ('text','title','author','era','notes')):
+                db.execute('''INSERT INTO revisions(document_id,text,title,author,era,notes,created_at)
+                    VALUES (?,?,?,?,?,?,?)''', (doc_id, old['text'], old['title'], old['author'], old['era'], old['notes'], now()))
+                # Any content edit needs explicit review, even if it was reviewed before.
+                values.setdefault('reviewed', 0)
+            if 'text' in values and values['text'].strip():
+                values['status'] = 'done'
+            if 'collection' in values:
+                db.execute('INSERT OR IGNORE INTO collections VALUES (?)', (values['collection'],))
+            values['updated_at'] = now()
+            db.execute('UPDATE documents SET ' + ','.join(k+'=?' for k in values) + ' WHERE id=?', (*values.values(), doc_id))
+        return self.get(doc_id)
+
+    def import_file(self, path, filename, collection='未分诗集'):
+        filename = filename.replace('\\', '/').split('/')[-1]
+        ext = Path(filename).suffix.lower()
+        if ext not in ALLOWED:
+            raise ValueError('支持 JPG、PNG、WEBP、BMP 和 PDF 文件。')
+        if not 0 < path.stat().st_size <= MAX_FILE:
+            raise ValueError('单个文件需大于 0 字节且不超过 200 MB。')
+        with path.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        with self.connect() as db:
+            existing = db.execute('SELECT id,trashed FROM documents WHERE sha256=?', (digest,)).fetchone()
+            if existing:
+                if existing['trashed']:
+                    self.update(existing['id'], trashed=0)
+                return self.get(existing['id']), True
+        doc_id = uuid.uuid4().hex
+        preview = self.root / 'previews' / (doc_id+'.jpg')
+        try:
+            if ext == '.pdf':
+                with PDF_LOCK:
+                    pdf = pdfium.PdfDocument(str(path))
+                    try:
+                        pages = len(pdf)
+                        if not 1 <= pages <= 600:
+                            raise ValueError('每份 PDF 最多支持 600 页，请先拆分。')
+                        page = pdf[0]
+                        scale = min(1.8, 1600 / max(page.get_size()))
+                        bitmap = page.render(scale=scale)
+                        bitmap.to_pil().convert('RGB').save(preview, quality=88)
+                        bitmap.close()
+                        page.close()
+                    finally:
+                        pdf.close()
+            else:
+                with Image.open(path) as image:
+                    image.load()
+                    pages = 1
+                    thumb = ImageOps.exif_transpose(image).convert('RGB')
+                    thumb.thumbnail((1600,1600))
+                    thumb.save(preview, quality=88)
+        except Exception as e:
+            preview.unlink(missing_ok=True)
+            raise ValueError('无法读取图片或 PDF；请检查文件是否损坏、加密或尺寸过大。') from e
+        source = self.root / 'originals' / (doc_id+ext)
+        try:
+            shutil.copyfile(path, source)
+            with self.connect() as db:
+                db.execute('''INSERT INTO documents
+                    (id,title,collection,filename,source,preview,sha256,pages,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                    (doc_id, Path(filename).stem, collection, filename,
+                     source.relative_to(self.root).as_posix(), preview.relative_to(self.root).as_posix(), digest, pages, now(), now()))
+                db.execute('INSERT OR IGNORE INTO collections VALUES (?)', (collection,))
+        except Exception:
+            source.unlink(missing_ok=True)
+            preview.unlink(missing_ok=True)
+            raise
+        return self.get(doc_id), False
+
+    def page_preview(self, doc_id, number, full=False):
+        doc = self.get(doc_id)
+        if not 1 <= number <= doc['pages']:
+            raise ValueError('页码超出范围')
+        if full and Path(doc['source']).suffix != '.pdf':
+            return self.root / doc['source']
+        if number == 1 and not full:
+            return self.root / doc['preview']
+        destination = self.root / 'previews' / f'{doc_id}-{number}{"-full" if full else ""}.jpg'
+        with PDF_LOCK:
+            if not destination.exists():
+                pdf = pdfium.PdfDocument(str(self.root / doc['source']))
+                try:
+                    page = pdf[number-1]
+                    bitmap = page.render(scale=min(4 if full else 2, (3000 if full else 2200)/max(page.get_size())))
+                    bitmap.to_pil().convert('RGB').save(destination, quality=92)
+                    bitmap.close()
+                    page.close()
+                finally:
+                    pdf.close()
+        return destination
+
+    def backup(self):
+        filename = f'拾笺备份-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.zip'
+        target = self.root / 'exports' / filename
+        snapshot = self.root / 'tmp' / (uuid.uuid4().hex+'.sqlite3')
+        with self.lock:
+            with self.connect() as db:
+                copy = sqlite3.connect(snapshot)
+                try:
+                    db.backup(copy)
+                finally:
+                    copy.close()
+            try:
+                with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+                    archive.write(snapshot, 'library.sqlite3')
+                    for folder in ('originals','previews','results'):
+                        for file in (self.root/folder).rglob('*'):
+                            if file.is_file():
+                                archive.write(file, file.relative_to(self.root).as_posix())
+                    archive.writestr('恢复说明.txt', '关闭拾笺，将此压缩包完整解压至新的空文件夹。启动拾笺前设置 SHIJIAN_DATA_DIR 为该文件夹的绝对路径，即可恢复完整诗库。也可在备份原有诗库后，替换原数据目录。识别引擎需另行安装。\n')
+                    archive.writestr('manifest.json', json.dumps({'app':'shijian','version':1,'created_at':now()}, ensure_ascii=False))
+            finally:
+                snapshot.unlink(missing_ok=True)
+        return target
+
+    def export(self, ids, format='txt'):
+        if format not in ('txt','md','archive'):
+            raise ValueError('不支持的导出格式')
+        target = self.root / 'exports' / f'拾笺诗集-{uuid.uuid4().hex[:8]}.zip'
+        with self.lock, zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED) as archive:
+            for doc_id in dict.fromkeys(ids):
+                doc = self.get(doc_id)
+                name = safe_name(doc['title']) + '-' + doc_id[:8]
+                content = f"{doc['title']}\n{doc['era']} · {doc['author']}\n\n{doc['text']}\n"
+                if format == 'md':
+                    content = '# ' + content
+                archive.writestr(name + ('.md' if format=='md' else '.txt'), content.encode('utf-8-sig' if format=='txt' else 'utf-8'))
+                if format == 'archive':
+                    archive.write(self.root/doc['source'], name+'/原稿'+Path(doc['source']).suffix)
+                    archive.writestr(name+'/档案.json', json.dumps(doc, ensure_ascii=False, indent=2))
+                    with self.connect() as db:
+                        versions = [dict(r) for r in db.execute('SELECT * FROM revisions WHERE document_id=? ORDER BY id', (doc_id,))]
+                    archive.writestr(name+'/校对历史.json', json.dumps(versions, ensure_ascii=False, indent=2))
+        return target

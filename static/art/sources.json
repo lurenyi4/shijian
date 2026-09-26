@@ -1,0 +1,80 @@
+[
+  {
+    "object_id": 41481,
+    "title": "王翚、王时敏《仿古山水图册》",
+    "retrieved": "2026-09-26",
+    "date": "dated 1674 and 1677",
+    "image_url": "https://images.metmuseum.org/CRDImages/as/original/DP154156_CRD.jpg",
+    "rights": "Public Domain / The Met Open Access (CC0)",
+    "artist": "Wang Hui",
+    "source": "https://www.metmuseum.org/art/collection/search/41481",
+    "credit": "Purchase, The Dillon Fund Gift, 1989",
+    "file": "landscape.jpg",
+    "museum_title": "Landscapes after old masters"
+  },
+  {
+    "object_id": 65075,
+    "title": "王翚及学生《仿古山水图册》",
+    "retrieved": "2026-09-26",
+    "date": "dated 1692",
+    "image_url": "https://images.metmuseum.org/CRDImages/as/web-large/ASA299.jpg",
+    "rights": "Public Domain / The Met Open Access (CC0)",
+    "artist": "Wang Hui",
+    "source": "https://www.metmuseum.org/art/collection/search/65075",
+    "credit": "Gift of Marie-Hélène and Guy A. Weill, 2000",
+    "file": "masters.jpg",
+    "museum_title": "Landscapes after old masters"
+  },
+  {
+    "object_id": 49432,
+    "title": "潘思牧《山水图册》",
+    "retrieved": "2026-09-26",
+    "date": "19th century",
+    "image_url": "https://images.metmuseum.org/CRDImages/as/web-large/DP161176.jpg",
+    "rights": "Public Domain / The Met Open Access (CC0)",
+    "artist": "Pan Simu",
+    "source": "https://www.metmuseum.org/art/collection/search/49432",
+    "credit": "Gift of Robert Hatfield Ellsworth, in memory of La Ferne Hatfield Ellsworth, 1986",
+    "file": "mountains.jpg",
+    "museum_title": "Landscapes"
+  },
+  {
+    "object_id": 49236,
+    "title": "边寿民《墨荷芦叶图》",
+    "retrieved": "2026-09-26",
+    "date": "",
+    "image_url": "https://images.metmuseum.org/CRDImages/as/web-large/DP153923.jpg",
+    "rights": "Public Domain / The Met Open Access (CC0)",
+    "artist": "Bian Shoumin",
+    "source": "https://www.metmuseum.org/art/collection/search/49236",
+    "credit": "Bequest of John M. Crawford Jr., 1988",
+    "file": "lotus.jpg",
+    "museum_title": "Lotus Leaves and Water Reeds"
+  },
+  {
+    "object_id": 36089,
+    "title": "项圣谟《秋景山水》",
+    "retrieved": "2026-09-26",
+    "date": "ｄａｔｅｄ 1654",
+    "image_url": "https://images.metmuseum.org/CRDImages/as/web-large/DP153913.jpg",
+    "rights": "Public Domain / The Met Open Access (CC0)",
+    "artist": "Xiang Shengmo",
+    "source": "https://www.metmuseum.org/art/collection/search/36089",
+    "credit": "Seymour Fund, 1964",
+    "file": "autumn.jpg",
+    "museum_title": "Autumn Landscape, leaf from Album for Zhou Lianggong"
+  },
+  {
+    "object_id": 63372,
+    "title": "《十竹斋书画谱》册页",
+    "retrieved": "2026-09-26",
+    "date": "first edition printed in 1633",
+    "image_url": "https://images.metmuseum.org/CRDImages/as/web-large/LC-CP54_001.jpg",
+    "rights": "Public Domain / The Met Open Access (CC0)",
+    "artist": "",
+    "source": "https://www.metmuseum.org/art/collection/search/63372",
+    "credit": "Rogers Fund, 1924",
+    "file": "bamboo.jpg",
+    "museum_title": "Leaf from the Ten Bamboo Studio Manual of Painting and Calligraphy"
+  }
+]
