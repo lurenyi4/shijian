@@ -4,7 +4,7 @@
 
 ## 直接使用
 
-在这台电脑，双击 `release\Shijian\Shijian.exe`，或双击项目目录的 `start.cmd`。
+在这台电脑，双击项目目录的 `start.cmd`，或 `release\current\Shijian\Shijian.exe`。启动入口优先使用更新版；旧目录 `release\Shijian` 可保留。升级后请先关闭已有窗口，再启动新版。
 
 1. 点击「导入诗稿」，多选图片或选择整个文件夹，也可以直接拖入文件。
 2. 选择诗集。导入只复制到本机，不会自动识别或上传文件。
@@ -61,7 +61,7 @@ MinerU 是可用的本地文档识别起点。实际手稿可能有连笔、异�
 | 文字、诗集、收藏、校对历史 | `library.sqlite3` |
 | 导出与备份的副本 | `exports` |
 
-导出支持 TXT、Markdown、带原图和历史的档案 ZIP。整库备份使用 SQLite 的一致性备份接口，包含原图、预览、结果和数据库；不包含 Python 环境和模型。识别运行中的任务在恢复后会显示已中断，需重新开始。
+导出支持 TXT、Markdown、带原图和历史的档案 ZIP。整库备份使用 SQLite 的一致性备份接口，包含快照时的原图、缩略图、已结束的识别结果和数据库；不包含 Python 环境和模型。压缩期间可以继续读取和保存，后续修改进入下一份备份。正在写入的识别产物会跳过，并记录在 manifest.json 中；这些任务恢复后显示已中断，需重新开始。PDF 分页预览恢复后按需重新生成。
 
 **恢复到新目录（推荐）：** 关闭拾笺，把备份解压到一个空文件夹，例如 `D:\家藏诗库`，创建一个启动用的 CMD：
 
@@ -95,7 +95,11 @@ python -m venv .venv
 
 开发预览：`python desktop.py --server --port 8765 --data-dir .qa\library`。服务仅监听 `127.0.0.1`，不向局域网开放；写操作验证本机会话和请求来源。
 
-打包：安装 `pyinstaller` 后运行 `build.ps1`。测试：安装 `pytest httpx`，运行 `python -m pytest -q`。
+打包：安装 `pyinstaller` 后运行 `build.ps1`，输出至 `release\current\Shijian`。可用 `-BuildOutput` 指定项目内的其他输出目录；构建会检查目标程序是否正在运行。
+
+后端测试：安装 `pytest httpx`，运行 `python -m pytest -q`。前端回归测试使用 Node.js 内置测试运行器：`node --test tests/frontend.test.cjs`，无需额外前端依赖。
+
+列表只返回短摘要，全文和札记搜索在本机数据库执行；画廊每页显示 48 份，批量全选和导出仍覆盖当前全部筛选结果。识别期间仅轮询任务摘要，有变更时刷新列表及未编辑的阅读页。保存期间会暂时锁定编辑区；保存失败会保留草稿，空正文不能标记为已校对。
 
 ## 验证范围与限制
 

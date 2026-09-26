@@ -13,12 +13,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image
 import pypdfium2 as pdfium
 
 from demo import POEMS, artwork, artwork_note
+from imaging import manuscript_rgb
 
-ALLOWED = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.pdf'}
+ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".pdf"}
 MAX_FILE = 200 * 1024 * 1024
 PDF_LOCK = threading.Lock()
 
@@ -28,22 +29,27 @@ def now():
 
 
 def default_data_dir():
-    return Path(os.environ.get('SHIJIAN_DATA_DIR') or (Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'Shijian' / 'library'))
+    return Path(
+        os.environ.get("SHIJIAN_DATA_DIR")
+        or (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Shijian" / "library")
+    )
 
 
 def safe_name(value):
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', value).strip('. ')[:90] or '无题'
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(". ")[:90] or "无题"
 
 
 class Library:
     def __init__(self, root: Path, seed=True):
         self.root = Path(root).resolve()
         self.lock = threading.RLock()
-        for part in ('originals', 'previews', 'results', 'tmp', 'exports'):
+        self.preview_lock = threading.Lock()
+        self.active_results: set[Path] = set()
+        for part in ("originals", "previews", "results", "tmp", "exports"):
             (self.root / part).mkdir(parents=True, exist_ok=True)
-        self.db = self.root / 'library.sqlite3'
+        self.db = self.root / "library.sqlite3"
         with self.connect() as db:
-            db.executescript('''
+            db.executescript("""
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS documents (
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, author TEXT DEFAULT '', era TEXT DEFAULT '',
@@ -61,21 +67,27 @@ class Library:
                 );
                 CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            ''')
+                CREATE INDEX IF NOT EXISTS revisions_document ON revisions(document_id, id);
+            """)
             # An interrupted process is never misreported as still running.
-            db.execute("UPDATE documents SET status='interrupted',error='上次识别被中断，可重新加入队列。' WHERE status IN ('queued','running')")
-        if seed and not self.setting('seeded', False):
+            db.execute(
+                "UPDATE documents SET status='interrupted',error='上次识别被中断，可重新加入队列。' WHERE status IN ('queued','running')"
+            )
+        if seed and not self.setting("seeded", False):
             self.seed()
-            self.set_setting('seeded', True)
-        if seed and self.setting('artwork_version', 0) < 2:
+            self.set_setting("seeded", True)
+        if seed and self.setting("artwork_version", 0) < 2:
             self.migrate_demo_art()
-            self.set_setting('artwork_version', 2)
+            self.set_setting("artwork_version", 2)
 
     @contextmanager
     def connect(self):
         with self.lock:
             db = sqlite3.connect(self.db, timeout=30)
             db.row_factory = sqlite3.Row
+            db.create_function(
+                "casefold", 1, lambda value: (value or "").casefold(), deterministic=True
+            )
             try:
                 yield db
                 db.commit()
@@ -87,104 +99,234 @@ class Library:
 
     def setting(self, key, default=None):
         with self.connect() as db:
-            row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
-        return json.loads(row['value']) if row else default
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else default
 
     def set_setting(self, key, value):
         with self.connect() as db:
-            db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, json.dumps(value, ensure_ascii=False)))
+            db.execute(
+                "INSERT OR REPLACE INTO settings VALUES (?,?)",
+                (key, json.dumps(value, ensure_ascii=False)),
+            )
 
     def seed(self):
         for i, (title, author, era, text, collection, motif) in enumerate(POEMS):
-            doc_id = 'demo-' + str(i+1)
-            relative = f'originals/{doc_id}.jpg'
+            doc_id = "demo-" + str(i + 1)
+            relative = f"originals/{doc_id}.jpg"
             image, attribution = artwork(motif)
             shutil.copyfile(image, self.root / relative)
             with self.connect() as db:
-                db.execute('''INSERT OR IGNORE INTO documents
+                db.execute(
+                    """INSERT OR IGNORE INTO documents
                     (id,title,author,era,collection,filename,source,preview,sha256,text,raw_text,status,favorite,reviewed,demo,created_at,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                    (doc_id, title, author, era, collection, title+'-赏读配图.jpg', relative, relative,
-                     doc_id, text, text, 'done', int(i in (0, 3)), 1, 1, now(), now()))
-                db.execute('INSERT OR IGNORE INTO collections VALUES (?)', (collection,))
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        doc_id,
+                        title,
+                        author,
+                        era,
+                        collection,
+                        title + "-赏读配图.jpg",
+                        relative,
+                        relative,
+                        doc_id,
+                        text,
+                        text,
+                        "done",
+                        int(i in (0, 3)),
+                        1,
+                        1,
+                        now(),
+                        now(),
+                    ),
+                )
+                db.execute("INSERT OR IGNORE INTO collections VALUES (?)", (collection,))
 
     def migrate_demo_art(self):
         for i, (title, _, _, _, _, key) in enumerate(POEMS):
             image, attribution = artwork(key)
-            doc_id = 'demo-' + str(i+1)
-            relative = f'originals/{doc_id}.jpg'
-            shutil.copyfile(image, self.root/relative)
+            doc_id = "demo-" + str(i + 1)
+            relative = f"originals/{doc_id}.jpg"
+            shutil.copyfile(image, self.root / relative)
             with self.connect() as db:
-                db.execute('UPDATE documents SET source=?,preview=?,filename=?,notes=? WHERE id=? AND demo=1',
-                           (relative, relative, title+'-赏读配图.jpg', artwork_note(attribution), doc_id))
+                db.execute(
+                    "UPDATE documents SET source=?,preview=?,filename=?,notes=? WHERE id=? AND demo=1",
+                    (
+                        relative,
+                        relative,
+                        title + "-赏读配图.jpg",
+                        artwork_note(attribution),
+                        doc_id,
+                    ),
+                )
 
     def get(self, doc_id):
         with self.connect() as db:
-            row = db.execute('SELECT * FROM documents WHERE id=?', (doc_id,)).fetchone()
+            return self._get(db, doc_id)
+
+    @staticmethod
+    def _get(db, doc_id):
+        row = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
         if not row:
-            raise KeyError('找不到这份诗稿')
+            raise KeyError("找不到这份诗稿")
         return dict(row)
 
     def all(self, include_trash=False):
         with self.connect() as db:
-            rows = db.execute('SELECT * FROM documents ' + ('' if include_trash else 'WHERE trashed=0 ') + 'ORDER BY created_at DESC,id').fetchall()
+            rows = db.execute(
+                "SELECT * FROM documents "
+                + ("" if include_trash else "WHERE trashed=0 ")
+                + "ORDER BY created_at DESC,id"
+            ).fetchall()
         return [dict(r) for r in rows]
 
-    def update(self, doc_id, **values):
-        allowed = {'title','author','era','collection','text','raw_text','notes','status','favorite','reviewed','trashed','error'}
-        if set(values) - allowed:
-            raise ValueError('不支持的字段')
-        values['updated_at'] = now()
+    def summaries(self, ids=None):
+        # Keep long text and notes inside SQLite; list and polling responses are bounded.
+        columns = """id,title,author,era,collection,filename,pages,status,favorite,
+                     reviewed,demo,trashed,error,created_at,updated_at,
+                     substr(text,1,180) AS excerpt,length(text)>0 AS has_text"""
+        parameters = tuple(dict.fromkeys(ids)) if ids is not None else ()
+        if ids is not None and not parameters:
+            return []
+        where = (
+            " WHERE id IN (" + ",".join("?" for _ in parameters) + ")" if ids is not None else ""
+        )
         with self.connect() as db:
-            db.execute('UPDATE documents SET ' + ','.join(k+'=?' for k in values) + ' WHERE id=?', (*values.values(), doc_id))
+            rows = db.execute(
+                "SELECT " + columns + " FROM documents" + where + " ORDER BY created_at DESC,id",
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def search(self, query):
+        fields = ("title", "author", "era", "text", "notes", "filename", "collection")
+        clause = " OR ".join(f"instr(casefold({field}), ?) > 0" for field in fields)
+        with self.connect() as db:
+            return [
+                row["id"]
+                for row in db.execute(
+                    "SELECT id FROM documents WHERE " + clause, (query.casefold(),) * len(fields)
+                )
+            ]
+
+    def update(self, doc_id, **values):
+        allowed = {
+            "title",
+            "author",
+            "era",
+            "collection",
+            "text",
+            "raw_text",
+            "notes",
+            "status",
+            "favorite",
+            "reviewed",
+            "trashed",
+            "error",
+        }
+        if set(values) - allowed:
+            raise ValueError("不支持的字段")
+        values["updated_at"] = now()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE documents SET " + ",".join(k + "=?" for k in values) + " WHERE id=?",
+                (*values.values(), doc_id),
+            )
 
     def edit(self, doc_id, values):
+        allowed = {
+            "title",
+            "author",
+            "era",
+            "collection",
+            "text",
+            "notes",
+            "favorite",
+            "reviewed",
+            "trashed",
+        }
+        if set(values) - allowed:
+            raise ValueError("不支持的字段")
         with self.connect() as db:
-            old = self.get(doc_id)
-            if old['status'] in ('running','queued'):
-                raise ValueError('正在识别，请等待完成后校对。')
-            if any(k in values and values[k] != old[k] for k in ('text','title','author','era','notes')):
-                db.execute('''INSERT INTO revisions(document_id,text,title,author,era,notes,created_at)
-                    VALUES (?,?,?,?,?,?,?)''', (doc_id, old['text'], old['title'], old['author'], old['era'], old['notes'], now()))
-                # Any content edit needs explicit review, even if it was reviewed before.
-                values.setdefault('reviewed', 0)
-            if 'text' in values and values['text'].strip():
-                values['status'] = 'done'
-            if 'collection' in values:
-                db.execute('INSERT OR IGNORE INTO collections VALUES (?)', (values['collection'],))
-            values['updated_at'] = now()
-            db.execute('UPDATE documents SET ' + ','.join(k+'=?' for k in values) + ' WHERE id=?', (*values.values(), doc_id))
-        return self.get(doc_id)
+            return self._edit(db, doc_id, dict(values))
 
-    def import_file(self, path, filename, collection='未分诗集'):
-        filename = filename.replace('\\', '/').split('/')[-1]
+    def finish_recognition(self, doc_id, text):
+        if not text.strip():
+            raise ValueError("未识别到文字。请尝试更清晰的照片或更高的识别档位。")
+        with self.connect() as db:
+            return self._edit(
+                db,
+                doc_id,
+                {
+                    "text": text,
+                    "raw_text": text,
+                    "reviewed": 0,
+                    "error": "",
+                },
+                recognizing=True,
+            )
+
+    def _edit(self, db, doc_id, values, recognizing=False):
+        old = self._get(db, doc_id)
+        if old["status"] in ("running", "queued") and not recognizing:
+            raise ValueError("正在识别，请等待完成后校对。")
+        text = values.get("text", old["text"])
+        if values.get("reviewed") and not text.strip():
+            raise ValueError("请先识别或填写文字，再标记为已校对。")
+        if any(
+            k in values and values[k] != old[k] for k in ("text", "title", "author", "era", "notes")
+        ):
+            db.execute(
+                """INSERT INTO revisions(document_id,text,title,author,era,notes,created_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (doc_id, old["text"], old["title"], old["author"], old["era"], old["notes"], now()),
+            )
+            values.setdefault("reviewed", 0)
+        if "text" in values:
+            values["status"] = "done" if text.strip() else "new"
+            values["error"] = ""
+        if not text.strip():
+            values["reviewed"] = 0
+        if "collection" in values:
+            db.execute("INSERT OR IGNORE INTO collections VALUES (?)", (values["collection"],))
+        values["updated_at"] = now()
+        db.execute(
+            "UPDATE documents SET " + ",".join(k + "=?" for k in values) + " WHERE id=?",
+            (*values.values(), doc_id),
+        )
+        return self._get(db, doc_id)
+
+    def import_file(self, path, filename, collection="未分诗集"):
+        filename = filename.replace("\\", "/").split("/")[-1]
         ext = Path(filename).suffix.lower()
         if ext not in ALLOWED:
-            raise ValueError('支持 JPG、PNG、WEBP、BMP 和 PDF 文件。')
+            raise ValueError("支持 JPG、PNG、WEBP、BMP 和 PDF 文件。")
         if not 0 < path.stat().st_size <= MAX_FILE:
-            raise ValueError('单个文件需大于 0 字节且不超过 200 MB。')
-        with path.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            raise ValueError("单个文件需大于 0 字节且不超过 200 MB。")
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
         with self.connect() as db:
-            existing = db.execute('SELECT id,trashed FROM documents WHERE sha256=?', (digest,)).fetchone()
+            existing = db.execute(
+                "SELECT id,trashed FROM documents WHERE sha256=?", (digest,)
+            ).fetchone()
             if existing:
-                if existing['trashed']:
-                    self.update(existing['id'], trashed=0)
-                return self.get(existing['id']), True
+                if existing["trashed"]:
+                    self.update(existing["id"], trashed=0)
+                return self.get(existing["id"]), True
         doc_id = uuid.uuid4().hex
-        preview = self.root / 'previews' / (doc_id+'.jpg')
+        preview = self.root / "previews" / (doc_id + (".jpg" if ext == ".pdf" else "-v2.jpg"))
         try:
-            if ext == '.pdf':
+            if ext == ".pdf":
                 with PDF_LOCK:
                     pdf = pdfium.PdfDocument(str(path))
                     try:
                         pages = len(pdf)
                         if not 1 <= pages <= 600:
-                            raise ValueError('每份 PDF 最多支持 600 页，请先拆分。')
+                            raise ValueError("每份 PDF 最多支持 600 页，请先拆分。")
                         page = pdf[0]
                         scale = min(1.8, 1600 / max(page.get_size()))
                         bitmap = page.render(scale=scale)
-                        bitmap.to_pil().convert('RGB').save(preview, quality=88)
+                        bitmap.to_pil().convert("RGB").save(preview, quality=88)
                         bitmap.close()
                         page.close()
                     finally:
@@ -193,22 +335,34 @@ class Library:
                 with Image.open(path) as image:
                     image.load()
                     pages = 1
-                    thumb = ImageOps.exif_transpose(image).convert('RGB')
-                    thumb.thumbnail((1600,1600))
+                    thumb = manuscript_rgb(image)
+                    thumb.thumbnail((1600, 1600))
                     thumb.save(preview, quality=88)
         except Exception as e:
             preview.unlink(missing_ok=True)
-            raise ValueError('无法读取图片或 PDF；请检查文件是否损坏、加密或尺寸过大。') from e
-        source = self.root / 'originals' / (doc_id+ext)
+            raise ValueError("无法读取图片或 PDF；请检查文件是否损坏、加密或尺寸过大。") from e
+        source = self.root / "originals" / (doc_id + ext)
         try:
             shutil.copyfile(path, source)
             with self.connect() as db:
-                db.execute('''INSERT INTO documents
+                db.execute(
+                    """INSERT INTO documents
                     (id,title,collection,filename,source,preview,sha256,pages,created_at,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)''',
-                    (doc_id, Path(filename).stem, collection, filename,
-                     source.relative_to(self.root).as_posix(), preview.relative_to(self.root).as_posix(), digest, pages, now(), now()))
-                db.execute('INSERT OR IGNORE INTO collections VALUES (?)', (collection,))
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        doc_id,
+                        Path(filename).stem,
+                        collection,
+                        filename,
+                        source.relative_to(self.root).as_posix(),
+                        preview.relative_to(self.root).as_posix(),
+                        digest,
+                        pages,
+                        now(),
+                        now(),
+                    ),
+                )
+                db.execute("INSERT OR IGNORE INTO collections VALUES (?)", (collection,))
         except Exception:
             source.unlink(missing_ok=True)
             preview.unlink(missing_ok=True)
@@ -217,66 +371,149 @@ class Library:
 
     def page_preview(self, doc_id, number, full=False):
         doc = self.get(doc_id)
-        if not 1 <= number <= doc['pages']:
-            raise ValueError('页码超出范围')
-        if full and Path(doc['source']).suffix != '.pdf':
-            return self.root / doc['source']
+        if not 1 <= number <= doc["pages"]:
+            raise ValueError("页码超出范围")
+        if full and Path(doc["source"]).suffix != ".pdf":
+            return self.root / doc["source"]
         if number == 1 and not full:
-            return self.root / doc['preview']
-        destination = self.root / 'previews' / f'{doc_id}-{number}{"-full" if full else ""}.jpg'
+            if not doc["demo"] and Path(doc["source"]).suffix != ".pdf":
+                return self.image_preview(doc)
+            return self.root / doc["preview"]
+        destination = self.root / "previews" / f"{doc_id}-{number}{'-full' if full else ''}.jpg"
         with PDF_LOCK:
             if not destination.exists():
-                pdf = pdfium.PdfDocument(str(self.root / doc['source']))
+                pdf = pdfium.PdfDocument(str(self.root / doc["source"]))
                 try:
-                    page = pdf[number-1]
-                    bitmap = page.render(scale=min(4 if full else 2, (3000 if full else 2200)/max(page.get_size())))
-                    bitmap.to_pil().convert('RGB').save(destination, quality=92)
+                    page = pdf[number - 1]
+                    bitmap = page.render(
+                        scale=min(4 if full else 2, (3000 if full else 2200) / max(page.get_size()))
+                    )
+                    bitmap.to_pil().convert("RGB").save(destination, quality=92)
                     bitmap.close()
                     page.close()
                 finally:
                     pdf.close()
         return destination
 
-    def backup(self):
-        filename = f'拾笺备份-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.zip'
-        target = self.root / 'exports' / filename
-        snapshot = self.root / 'tmp' / (uuid.uuid4().hex+'.sqlite3')
+    def image_preview(self, doc):
+        """Upgrade old thumbnails on demand, keeping previous snapshots' files intact."""
+        destination = self.root / "previews" / (doc["id"] + "-v2.jpg")
+        if self.root / doc["preview"] == destination:
+            return destination
+        with self.preview_lock:
+            if not destination.exists():
+                temporary = self.root / "tmp" / (uuid.uuid4().hex + ".jpg")
+                try:
+                    with Image.open(self.root / doc["source"]) as image:
+                        thumb = manuscript_rgb(image)
+                        thumb.thumbnail((1600, 1600))
+                        thumb.save(temporary, quality=88)
+                    temporary.replace(destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            with self.connect() as db:
+                db.execute(
+                    "UPDATE documents SET preview=? WHERE id=?",
+                    (destination.relative_to(self.root).as_posix(), doc["id"]),
+                )
+        return destination
+
+    @contextmanager
+    def result_attempt(self, doc_id):
+        # Completed attempts are immutable. Backup must never copy files still being written.
+        work = self.root / "results" / doc_id / uuid.uuid4().hex[:12]
         with self.lock:
+            work.mkdir(parents=True)
+            self.active_results.add(work)
+        try:
+            yield work
+        finally:
+            with self.lock:
+                self.active_results.discard(work)
+
+    def backup(self):
+        filename = f"拾笺备份-{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.zip"
+        target = self.root / "exports" / filename
+        snapshot = self.root / "tmp" / (uuid.uuid4().hex + ".sqlite3")
+        try:
             with self.connect() as db:
                 copy = sqlite3.connect(snapshot)
                 try:
                     db.backup(copy)
                 finally:
                     copy.close()
-            try:
-                with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
-                    archive.write(snapshot, 'library.sqlite3')
-                    for folder in ('originals','previews','results'):
-                        for file in (self.root/folder).rglob('*'):
-                            if file.is_file():
-                                archive.write(file, file.relative_to(self.root).as_posix())
-                    archive.writestr('恢复说明.txt', '关闭拾笺，将此压缩包完整解压至新的空文件夹。启动拾笺前设置 SHIJIAN_DATA_DIR 为该文件夹的绝对路径，即可恢复完整诗库。也可在备份原有诗库后，替换原数据目录。识别引擎需另行安装。\n')
-                    archive.writestr('manifest.json', json.dumps({'app':'shijian','version':1,'created_at':now()}, ensure_ascii=False))
-            finally:
-                snapshot.unlink(missing_ok=True)
+                documents = db.execute("SELECT id,source,preview FROM documents").fetchall()
+                files = {self.root / doc[key] for doc in documents for key in ("source", "preview")}
+                skipped = []
+                for doc in documents:
+                    result_dir = self.root / "results" / doc["id"]
+                    if not result_dir.exists():
+                        continue
+                    for attempt in result_dir.iterdir():
+                        if attempt in self.active_results:
+                            skipped.append(attempt.relative_to(self.root).as_posix())
+                        elif attempt.is_dir():
+                            files.update(file for file in attempt.rglob("*") if file.is_file())
+                created_at = now()
+            # Originals, first-page previews, and completed attempts are immutable.
+            # Lazy PDF page previews can be rebuilt and need not hold up the snapshot.
+            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.write(snapshot, "library.sqlite3")
+                for file in sorted(files):
+                    archive.write(file, file.relative_to(self.root).as_posix())
+                archive.writestr(
+                    "恢复说明.txt",
+                    "关闭拾笺，将此压缩包完整解压至新的空文件夹。启动拾笺前设置 SHIJIAN_DATA_DIR 为该文件夹的绝对路径，即可恢复完整诗库。识别引擎需另行安装。备份中的运行任务恢复后显示已中断；正在写入的识别产物不纳入备份。PDF 分页预览会按需重新生成。\n",
+                )
+                archive.writestr(
+                    "manifest.json",
+                    json.dumps(
+                        {
+                            "app": "shijian",
+                            "version": 1,
+                            "created_at": created_at,
+                            "skipped_active_results": skipped,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        finally:
+            snapshot.unlink(missing_ok=True)
         return target
 
-    def export(self, ids, format='txt'):
-        if format not in ('txt','md','archive'):
-            raise ValueError('不支持的导出格式')
-        target = self.root / 'exports' / f'拾笺诗集-{uuid.uuid4().hex[:8]}.zip'
-        with self.lock, zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED) as archive:
+    def export(self, ids, format="txt"):
+        if format not in ("txt", "md", "archive"):
+            raise ValueError("不支持的导出格式")
+        target = self.root / "exports" / f"拾笺诗集-{uuid.uuid4().hex[:8]}.zip"
+        with self.lock, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
             for doc_id in dict.fromkeys(ids):
                 doc = self.get(doc_id)
-                name = safe_name(doc['title']) + '-' + doc_id[:8]
+                name = safe_name(doc["title"]) + "-" + doc_id[:8]
                 content = f"{doc['title']}\n{doc['era']} · {doc['author']}\n\n{doc['text']}\n"
-                if format == 'md':
-                    content = '# ' + content
-                archive.writestr(name + ('.md' if format=='md' else '.txt'), content.encode('utf-8-sig' if format=='txt' else 'utf-8'))
-                if format == 'archive':
-                    archive.write(self.root/doc['source'], name+'/原稿'+Path(doc['source']).suffix)
-                    archive.writestr(name+'/档案.json', json.dumps(doc, ensure_ascii=False, indent=2))
+                if format == "md":
+                    content = "# " + content
+                archive.writestr(
+                    name + (".md" if format == "md" else ".txt"),
+                    content.encode("utf-8-sig" if format == "txt" else "utf-8"),
+                )
+                if format == "archive":
+                    archive.write(
+                        self.root / doc["source"], name + "/原稿" + Path(doc["source"]).suffix
+                    )
+                    archive.writestr(
+                        name + "/档案.json", json.dumps(doc, ensure_ascii=False, indent=2)
+                    )
                     with self.connect() as db:
-                        versions = [dict(r) for r in db.execute('SELECT * FROM revisions WHERE document_id=? ORDER BY id', (doc_id,))]
-                    archive.writestr(name+'/校对历史.json', json.dumps(versions, ensure_ascii=False, indent=2))
+                        versions = [
+                            dict(r)
+                            for r in db.execute(
+                                "SELECT * FROM revisions WHERE document_id=? ORDER BY id", (doc_id,)
+                            )
+                        ]
+                    archive.writestr(
+                        name + "/校对历史.json", json.dumps(versions, ensure_ascii=False, indent=2)
+                    )
         return target

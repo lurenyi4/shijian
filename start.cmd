@@ -1,6 +1,10 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+if exist "release\current\Shijian\Shijian.exe" (
+  start "" "release\current\Shijian\Shijian.exe"
+  exit /b
+)
 if exist "release\Shijian\Shijian.exe" (
   start "" "release\Shijian\Shijian.exe"
   exit /b
