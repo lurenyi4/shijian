@@ -79,9 +79,15 @@ function prepareEditor(h) {
 test('saving locks input, rejects duplicate submissions, and saves the displayed draft', async () => {
   const h = harness();
   prepareEditor(h);
-  h.run(`globalThis.calls=0;api=async(url,options)=>{calls++;
+  h.run(`globalThis.calls=0;api=async(url,options)=>{
+    if(options.method==='PUT') return {draft_version:'v1'};
+    calls++;
     globalThis.sent=options.body;return new Promise(resolve=>globalThis.finish=resolve);};`);
   const save = h.run('saveEdit(false)');
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
   assert.equal(h.node('#edit-text').disabled, true);
   assert.equal(h.node('#edit-title').disabled, true);
   assert.equal(h.node('#edit-cancel').disabled, true);
@@ -106,6 +112,50 @@ test('failed save keeps the draft editable and never redraws it', async () => {
   assert.equal(h.run('state.editing'), true);
   assert.equal(h.run('state.saving'), false);
   assert.equal(h.run('renderCount'), 0);
+});
+
+test('recovery writes are serialized and a formal save waits for them', async () => {
+  const h = harness();
+  prepareEditor(h);
+  h.run(`globalThis.calls=[];api=async(url,options)=>{
+    calls.push(options.method);
+    if(options.method==='PUT' && calls.length===1) return new Promise(resolve=>globalThis.finishDraft=resolve);
+    if(options.method==='PUT') return {draft_version:'v2'};
+    return {id:'one',...options.body,updated_at:'2'};
+  };`);
+  const draft = h.run('persistRecoveryDraft()');
+  await Promise.resolve();
+  await Promise.resolve();
+  const save = h.run('saveEdit(false)');
+  assert.deepEqual(Array.from(h.run('calls')), ['PUT']);
+  h.run('finishDraft({draft_version:"v1"})');
+  await draft;
+  await save;
+  assert.deepEqual(Array.from(h.run('calls')), ['PUT', 'PUT', 'PATCH']);
+  assert.equal(h.run('state.editing'), false);
+});
+
+test('immediate failed formal save has already persisted the latest keystrokes', async () => {
+  const h = harness();
+  prepareEditor(h);
+  h.node('#edit-text').value='刚输入且尚未自动保存';
+  h.run(`api=async(url,options)=>{
+    if(options.method==='PUT'){globalThis.recovery=options.body;return {draft_version:'v1'}};
+    throw Error('conflict');
+  };`);
+  await h.run('saveEdit(false)');
+  assert.equal(h.run('recovery.text'),'刚输入且尚未自动保存');
+  assert.equal(h.run('state.editing'),true);
+});
+
+test('failed recovery write keeps editor content and can retry', async () => {
+  const h = harness();
+  prepareEditor(h);
+  h.run(`api=async()=>{throw Error('disk full')};`);
+  assert.equal(await h.run('persistRecoveryDraft()'), false);
+  assert.equal(h.node('#edit-text').value, '需要保存的校對');
+  h.run('api=async()=>({})');
+  assert.equal(await h.run('persistRecoveryDraft()'), true);
 });
 
 test('list refresh failure after successful save is not reported as a failed save', async () => {

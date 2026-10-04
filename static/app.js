@@ -25,6 +25,7 @@ const state = {
   reader: null,
   editing: false,
   saving: false,
+  draftVersion: null,
   zoom: 1,
   rotation: 0,
   page: 1,
@@ -39,6 +40,8 @@ let searchTimer,
   refreshRequest = 0,
   readerRequest = 0;
 let toastTimer;
+let draftTimer = null;
+let draftPending = Promise.resolve(true);
 function toast(message) {
   $('#toast').textContent = message;
   $('#toast').classList.add('visible');
@@ -77,6 +80,7 @@ async function refresh() {
     engine: data.engine,
     session: data.session,
   });
+  document.body.classList.toggle('large-text', Boolean(data.preferences?.large_text));
   const ids = new Set(state.documents.map((d) => d.id));
   state.selected = new Set([...state.selected].filter((id) => ids.has(id)));
   renderNav();
@@ -542,7 +546,7 @@ function showSettings() {
         },
       });
       const large = $('#large-text').checked;
-      localStorage.setItem('shijian-large', String(large));
+      await api('/api/preferences', { method: 'PUT', body: { large_text: large } });
       document.body.classList.toggle('large-text', large);
       $('#modal').close();
       toast(
@@ -790,23 +794,83 @@ function renderReader() {
       recognize([d.id]);
     };
 }
-function startEditing() {
-  const d = state.reader;
+async function startEditing() {
+  const original = state.reader;
+  let d = original;
   if (['running', 'queued'].includes(d.status)) {
     toast('正在识别，请完成后再校对。');
     return;
   }
   if (state.editing) return;
+  try {
+    const draft = await api('/api/documents/' + d.id + '/draft');
+    if (state.reader !== original || state.editing) return;
+    state.draftVersion = draft?.draft_version ?? null;
+    if (draft && window.confirm(
+      (draft.base_updated_at !== original.updated_at ? '正文已更新，请恢复后仔细核对。\n' : '') +
+      '发现上次未完成的校对草稿，是否恢复？取消可从当前正文开始。',
+    )) d = { ...original, ...draft };
+  } catch (e) {
+    toast('无法读取恢复草稿：' + e.message);
+    return;
+  }
   state.editing = true;
   $('#edit-button').disabled = true;
   $('#reader-text').innerHTML =
     `<div class="editor-fields"><input id="edit-title" aria-label="诗稿标题" value="${esc(d.title)}" maxlength="200"><input id="edit-author" aria-label="作者" placeholder="作者" value="${esc(d.author)}" maxlength="100"><select id="edit-collection" aria-label="诗集">${collectionOptions(d.collection)}</select><input id="edit-era" aria-label="年代" placeholder="年代 / 写作年份" value="${esc(d.era)}" maxlength="100"></div><textarea class="editor-text" id="edit-text" aria-label="诗词正文" spellcheck="false">${esc(d.text)}</textarea><textarea class="editor-notes" id="edit-notes" aria-label="札记" placeholder="札记：写作时间、字迹疑问，或这首诗的故事…">${esc(d.notes)}</textarea><div class="editor-actions"><button class="button secondary" id="edit-cancel">取消</button><button class="button secondary" id="edit-save">保存草稿</button><button class="button primary" id="edit-reviewed">${icon('check')}保存并完成校对</button></div>`;
-  $('#edit-cancel').onclick = () => {
+  $('#edit-cancel').textContent = '退出校对（保留草稿）';
+  $('#edit-cancel').onclick = async () => {
+    if (state.saving) return;
+    setEditorSaving(true);
+    const kept = await persistRecoveryDraft(true);
+    setEditorSaving(false);
+    if (!kept) return;
     state.editing = false;
     renderReader();
   };
+  $$('.editor-fields input,.editor-fields select,#edit-text,#edit-notes').forEach((control) => {
+    control.oninput = scheduleRecoveryDraft;
+    control.onchange = scheduleRecoveryDraft;
+  });
   $('#edit-save').onclick = () => saveEdit(false);
   $('#edit-reviewed').onclick = () => saveEdit(true);
+}
+function editorValues() {
+  return {
+    title: $('#edit-title').value,
+    author: $('#edit-author').value,
+    era: $('#edit-era').value,
+    collection: $('#edit-collection').value,
+    text: $('#edit-text').value,
+    notes: $('#edit-notes').value,
+  };
+}
+function scheduleRecoveryDraft() {
+  if (draftTimer !== null || state.saving) return;
+  draftTimer = setTimeout(() => {
+    draftTimer = null;
+    persistRecoveryDraft();
+  }, 600);
+}
+function persistRecoveryDraft(force = false) {
+  clearTimeout(draftTimer);
+  draftTimer = null;
+  if (!state.editing || (state.saving && !force)) return draftPending;
+  const id = state.reader.id;
+  const body = { ...editorValues(), base_updated_at: state.reader.updated_at };
+  draftPending = draftPending.then(async () => {
+    try {
+      const saved = await api('/api/documents/' + id + '/draft', {
+        method: 'PUT', body: { ...body, draft_version: state.draftVersion },
+      });
+      state.draftVersion = saved.draft_version;
+      return true;
+    } catch (e) {
+      toast('恢复草稿尚未保存，请保留窗口并重试：' + e.message);
+      return false;
+    }
+  });
+  return draftPending;
 }
 async function saveEdit(reviewed) {
   if (!state.editing || state.saving) return;
@@ -819,6 +883,7 @@ async function saveEdit(reviewed) {
     text: $('#edit-text').value,
     notes: $('#edit-notes').value,
     reviewed,
+    expected_updated_at: state.reader.updated_at,
   };
   if (!body.title) {
     toast('请给诗稿起一个标题。');
@@ -829,7 +894,12 @@ async function saveEdit(reviewed) {
     return;
   }
   setEditorSaving(true);
+  clearTimeout(draftTimer);
+  draftTimer = null;
   try {
+    // Persist the latest keystrokes too, not only an earlier autosave request.
+    if (!(await persistRecoveryDraft(true))) return;
+    body.draft_version = state.draftVersion;
     const saved = await api('/api/documents/' + id, { method: 'PATCH', body });
     state.reader = saved;
     state.editing = false;
@@ -1027,7 +1097,6 @@ window.addEventListener('unhandledrejection', (e) => {
   toast(e.reason?.message || '操作未完成，请稍后再试。');
   e.preventDefault();
 });
-document.body.classList.toggle('large-text', localStorage.getItem('shijian-large') === 'true');
 (async () => {
   try {
     await refresh();

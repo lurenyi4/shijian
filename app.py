@@ -17,6 +17,8 @@ STATIC = Path(__file__).resolve().parent / "static"
 
 
 class Edit(BaseModel):
+    expected_updated_at: str | None = Field(None, max_length=100)
+    draft_version: str | None = Field(None, max_length=100)
     title: str | None = Field(None, min_length=1, max_length=200)
     author: str | None = Field(None, max_length=100)
     era: str | None = Field(None, max_length=100)
@@ -31,6 +33,21 @@ class Edit(BaseModel):
 class Selection(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=10000)
     force: bool = False
+
+
+class Draft(BaseModel):
+    draft_version: str | None = Field(None, max_length=100)
+    title: str = Field("", max_length=200)
+    author: str = Field("", max_length=100)
+    era: str = Field("", max_length=100)
+    collection: str = Field("未分诗集", min_length=1, max_length=100)
+    text: str = Field("", max_length=5_000_000)
+    notes: str = Field("", max_length=20000)
+    base_updated_at: str = Field(max_length=100)
+
+
+class Preferences(BaseModel):
+    large_text: bool = False
 
 
 class Export(Selection):
@@ -106,6 +123,7 @@ def create_app(data_dir=None, seed=True, run_worker=True):
             "collections": collections,
             "engine": engine.info(),
             "session": session,
+            "preferences": library.setting("preferences", {"large_text": False}),
         }
 
     @app.get("/api/search")
@@ -123,9 +141,25 @@ def create_app(data_dir=None, seed=True, run_worker=True):
     @app.patch("/api/documents/{doc_id}")
     def edit(doc_id: str, payload: Edit):
         values = payload.model_dump(exclude_none=True)
+        expected = values.pop("expected_updated_at", None)
+        draft_version = values.pop("draft_version", None)
         if values.get("trashed") and library.get(doc_id)["status"] in ("queued", "running"):
             engine.cancel([doc_id])
-        return library.edit(doc_id, values)
+        return library.edit(doc_id, values, expected, draft_version)
+
+    @app.get("/api/documents/{doc_id}/draft")
+    def draft(doc_id: str):
+        return library.draft(doc_id)
+
+    @app.put("/api/documents/{doc_id}/draft")
+    def save_draft(doc_id: str, payload: Draft):
+        return library.save_draft(doc_id, payload.model_dump())
+
+    @app.put("/api/preferences")
+    def preferences(payload: Preferences):
+        values = payload.model_dump()
+        library.set_setting("preferences", values)
+        return values
 
     @app.get("/api/documents/{doc_id}/revisions")
     def revisions(doc_id: str):

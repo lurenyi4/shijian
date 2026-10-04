@@ -67,6 +67,9 @@ class Library:
                 );
                 CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS drafts (
+                    document_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS revisions_document ON revisions(document_id, id);
             """)
             # An interrupted process is never misreported as still running.
@@ -233,7 +236,27 @@ class Library:
                 (*values.values(), doc_id),
             )
 
-    def edit(self, doc_id, values):
+    def draft(self, doc_id):
+        with self.connect() as db:
+            self._get(db, doc_id)
+            row = db.execute("SELECT payload FROM drafts WHERE document_id=?", (doc_id,)).fetchone()
+            return json.loads(row["payload"]) if row else None
+
+    def save_draft(self, doc_id, values):
+        with self.connect() as db:
+            doc = self._get(db, doc_id)
+            row = db.execute("SELECT payload FROM drafts WHERE document_id=?", (doc_id,)).fetchone()
+            current = json.loads(row["payload"]).get("draft_version") if row else None
+            if values.get("draft_version") != current:
+                raise ValueError("另一窗口已更新恢复草稿。本窗口文字仍保留，请先复制留存，再重新打开校对。")
+            if row is None and values.get("base_updated_at") != doc["updated_at"]:
+                raise ValueError("正文已更新，恢复草稿尚未写入。请保留本窗口文字并核对当前正文。")
+            values = {**values, "draft_version": uuid.uuid4().hex}
+            db.execute("INSERT OR REPLACE INTO drafts VALUES (?,?,?)",
+                       (doc_id, json.dumps(values, ensure_ascii=False), now()))
+        return values
+
+    def edit(self, doc_id, values, expected_updated_at=None, draft_version=None):
         allowed = {
             "title",
             "author",
@@ -248,7 +271,14 @@ class Library:
         if set(values) - allowed:
             raise ValueError("不支持的字段")
         with self.connect() as db:
-            return self._edit(db, doc_id, dict(values))
+            if expected_updated_at is not None and self._get(db, doc_id)["updated_at"] != expected_updated_at:
+                raise ValueError("正文已在其他窗口或识别任务中更新。请保留本窗口文字，重新打开并核对后保存。")
+            result = self._edit(db, doc_id, dict(values))
+            if "text" in values and draft_version is not None:
+                row = db.execute("SELECT payload FROM drafts WHERE document_id=?", (doc_id,)).fetchone()
+                if row and json.loads(row["payload"]).get("draft_version") == draft_version:
+                    db.execute("DELETE FROM drafts WHERE document_id=?", (doc_id,))
+            return result
 
     def finish_recognition(self, doc_id, text):
         if not text.strip():
@@ -487,33 +517,42 @@ class Library:
     def export(self, ids, format="txt"):
         if format not in ("txt", "md", "archive"):
             raise ValueError("不支持的导出格式")
-        target = self.root / "exports" / f"拾笺诗集-{uuid.uuid4().hex[:8]}.zip"
-        with self.lock, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+        # Capture documents and history together; compression never holds the library lock.
+        snapshot = []
+        with self.connect() as db:
             for doc_id in dict.fromkeys(ids):
-                doc = self.get(doc_id)
-                name = safe_name(doc["title"]) + "-" + doc_id[:8]
-                content = f"{doc['title']}\n{doc['era']} · {doc['author']}\n\n{doc['text']}\n"
-                if format == "md":
-                    content = "# " + content
-                archive.writestr(
-                    name + (".md" if format == "md" else ".txt"),
-                    content.encode("utf-8-sig" if format == "txt" else "utf-8"),
-                )
-                if format == "archive":
-                    archive.write(
-                        self.root / doc["source"], name + "/原稿" + Path(doc["source"]).suffix
-                    )
+                doc = self._get(db, doc_id)
+                versions = [dict(r) for r in db.execute(
+                    "SELECT * FROM revisions WHERE document_id=? ORDER BY id", (doc_id,)
+                )] if format == "archive" else []
+                snapshot.append((doc, versions))
+        if not snapshot:
+            raise ValueError("请先选择要导出的诗稿")
+        target = self.root / "exports" / f"拾笺诗集-{uuid.uuid4().hex[:8]}.zip"
+        temporary = self.root / "tmp" / (uuid.uuid4().hex + ".zip")
+        try:
+            with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+                for doc, versions in snapshot:
+                    doc_id = doc["id"]
+                    name = safe_name(doc["title"]) + "-" + doc_id[:8]
+                    content = f"{doc['title']}\n{doc['era']} · {doc['author']}\n\n{doc['text']}\n"
+                    if format == "md":
+                        content = "# " + content
                     archive.writestr(
-                        name + "/档案.json", json.dumps(doc, ensure_ascii=False, indent=2)
+                        name + (".md" if format == "md" else ".txt"),
+                        content.encode("utf-8-sig" if format == "txt" else "utf-8"),
                     )
-                    with self.connect() as db:
-                        versions = [
-                            dict(r)
-                            for r in db.execute(
-                                "SELECT * FROM revisions WHERE document_id=? ORDER BY id", (doc_id,)
-                            )
-                        ]
-                    archive.writestr(
-                        name + "/校对历史.json", json.dumps(versions, ensure_ascii=False, indent=2)
-                    )
+                    if format == "archive":
+                        archive.write(
+                            self.root / doc["source"], name + "/原稿" + Path(doc["source"]).suffix
+                        )
+                        archive.writestr(
+                            name + "/档案.json", json.dumps(doc, ensure_ascii=False, indent=2)
+                        )
+                        archive.writestr(
+                            name + "/校对历史.json", json.dumps(versions, ensure_ascii=False, indent=2)
+                        )
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
         return target
