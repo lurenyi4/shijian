@@ -91,6 +91,7 @@ class LocalEngine:
         self.active_id = None
         self.active_token = None
         self.worker = None
+        self.phase = '等待任务'
 
     def start(self):
         if self.worker and self.worker.is_alive():
@@ -118,7 +119,23 @@ class LocalEngine:
             "active_id": active,
             "data_dir": str(self.library.root),
             "pending": pending,
+            "phase": self.phase,
+            "readiness": '程序已找到；模型与离线运行需通过实际识别验证' if executable else '尚未找到程序',
         }
+
+    def diagnose(self):
+        executable = find_engine(self.config().get('executable', ''))
+        if not executable:
+            raise ValueError('尚未找到 MinerU 程序，请检查安装或路径。')
+        try:
+            result = subprocess.run([executable, '--version'], capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', timeout=20,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError('程序诊断未完成，请检查安装或稍后重试。') from exc
+        return {'executable': executable, 'version_output': (result.stdout + result.stderr)[-2000:],
+                'program_ok': result.returncode == 0,
+                'models': '尚未验证；请先用一份代表性手稿识别。离线模式需相关模型全部缓存。'}
 
     def enqueue(self, ids, force=False):
         if not self.info()["available"]:
@@ -175,6 +192,7 @@ class LocalEngine:
                         continue
                     self.active_id = doc_id
                     self.active_token = token
+                    self.phase = '准备原稿'
                 self.parse(doc_id, config, token)
             except Exception as exc:
                 with self.guard:
@@ -185,6 +203,7 @@ class LocalEngine:
                     self.process = None
                     self.active_id = None
                     self.active_token = None
+                    self.phase = '等待任务'
                     if self.jobs.get(doc_id) == token:
                         self.jobs.pop(doc_id, None)
                 self.pending.task_done()
@@ -209,6 +228,7 @@ class LocalEngine:
         if text is not None:
             with self.guard:
                 if self.is_current(doc_id, token):
+                    self.phase = '保存识别文字'
                     self.library.finish_recognition(doc_id, text)
 
     def parse_attempt(self, doc, config, token, executable, work):
@@ -258,6 +278,7 @@ class LocalEngine:
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
                 self.process = process
+                self.phase = '引擎运行中（首次可能准备模型，可停止）'
             deadline = time.monotonic() + 7200
             while process.poll() is None:
                 if self.stop_event.wait(0.5) or not self.is_current(doc_id, token):
@@ -285,6 +306,7 @@ class LocalEngine:
             )
         if not output.exists():
             raise ValueError("MinerU 没有生成结果文件，请检查版本是否为 4.x。")
+        self.phase = '读取识别结果'
         text = read_result(output)
         if not text.strip():
             raise ValueError("未识别到文字。请尝试更清晰的照片或更高的识别档位。")

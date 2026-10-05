@@ -1455,6 +1455,26 @@ dialog::backdrop {
 .large-text .page-heading p {
   font-size: 15px;
 }
+.large-text .editor-text { font-size: 29px; }
+.large-text .editor-fields input,
+.large-text .editor-fields select,
+.large-text .editor-notes,
+.large-text .field,
+.large-text .field input,
+.large-text .field select,
+.large-text .text-button,
+.large-text .pane-toolbar,
+.large-text .reader-error,
+.large-text .modal-body,
+.large-text .toast,
+.large-text .page-workflow,
+.large-text #editor-status { font-size: 17px; }
+.editor-actions { flex-wrap: wrap; }
+.page-workflow { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:12px 0; }
+.revision-compare { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+.revision-compare pre, .numbered-text { white-space:pre-wrap; overflow:auto; max-height:360px; }
+#search-status, #editor-status, #restore-status { white-space:pre-wrap; color:#42543a; }
+@media(max-width:850px) { .revision-compare { grid-template-columns:1fr; } }
 #drop-overlay {
   position: fixed;
   inset: 0;

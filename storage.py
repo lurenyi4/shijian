@@ -70,7 +70,16 @@ class Library:
                 CREATE TABLE IF NOT EXISTS drafts (
                     document_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS page_notes (
+                    document_id TEXT NOT NULL, page INTEGER NOT NULL, start_line INTEGER NOT NULL,
+                    reviewed INTEGER NOT NULL, text_version TEXT NOT NULL,
+                    PRIMARY KEY(document_id,page)
+                );
+                CREATE TABLE IF NOT EXISTS text_versions (
+                    document_id TEXT PRIMARY KEY, revision INTEGER NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS revisions_document ON revisions(document_id, id);
+                CREATE INDEX IF NOT EXISTS documents_updated ON documents(updated_at);
             """)
             # An interrupted process is never misreported as still running.
             db.execute(
@@ -111,6 +120,83 @@ class Library:
                 "INSERT OR REPLACE INTO settings VALUES (?,?)",
                 (key, json.dumps(value, ensure_ascii=False)),
             )
+
+    def preferences(self, values):
+        with self.lock:
+            merged = {**self.setting('preferences', {}), **values}
+            self.set_setting('preferences', merged)
+            return merged
+
+    def page_notes(self, doc_id):
+        with self.connect() as db:
+            doc = self._get(db, doc_id)
+            version = self._text_version(doc)
+            rows = [dict(row) for row in db.execute(
+                'SELECT * FROM page_notes WHERE document_id=? ORDER BY page', (doc_id,))]
+        return {'text_version': version, 'text_revision': doc['text_revision'], 'position': self.setting('position:' + doc_id, 1), 'pages': [
+            {**row, 'stale': row['text_version'] != version} for row in rows]}
+
+    @staticmethod
+    def _text_version(doc):
+        return hashlib.sha256(f"{doc['text_revision']}\0{doc['text']}".encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _bump_text(db, doc_id):
+        db.execute('INSERT INTO text_versions VALUES (?,1) ON CONFLICT(document_id) DO UPDATE SET revision=revision+1', (doc_id,))
+
+    def save_page_note(self, doc_id, page, start_line, reviewed, text_version):
+        with self.connect() as db:
+            doc = self._get(db, doc_id)
+            current = self._text_version(doc)
+            if current != text_version:
+                raise ValueError('正文已更新，请重新载入后设置分页位置。')
+            if doc['status'] in ('running', 'queued'):
+                raise ValueError('请在识别结束后设置分页位置。')
+            if not doc['text'].strip() or not 1 <= page <= doc['pages'] or not 1 <= start_line <= len(doc['text'].split('\n')):
+                raise ValueError('页码或正文起始行无效。')
+            for row in db.execute('SELECT * FROM page_notes WHERE document_id=? AND text_version=? AND page!=?',
+                                  (doc_id, current, page)):
+                if (row['page'] < page and row['start_line'] >= start_line or
+                        row['page'] > page and row['start_line'] <= start_line):
+                    raise ValueError('各页起始行必须按页码递增，请先调整相邻页的定位。')
+            db.execute('INSERT OR REPLACE INTO page_notes VALUES (?,?,?,?,?)',
+                       (doc_id, page, start_line, bool(reviewed), current))
+            db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('pages_revision',json.dumps(uuid.uuid4().hex)))
+        return self.page_notes(doc_id)
+
+    def rename_collection(self, source, target):
+        target = target.strip()
+        if not source or not 1 <= len(target) <= 100 or source == target:
+            raise ValueError('请填写不同的有效诗集名称。')
+        with self.connect() as db:
+            if not db.execute('SELECT 1 FROM collections WHERE name=?', (source,)).fetchone():
+                raise ValueError('原诗集不存在。')
+            db.execute('INSERT OR IGNORE INTO collections VALUES (?)', (target,))
+            db.execute('UPDATE documents SET collection=?,updated_at=? WHERE collection=?', (target, now(), source))
+            for row in db.execute('SELECT * FROM drafts').fetchall():
+                payload = json.loads(row['payload'])
+                if payload.get('collection') == source:
+                    payload.update(collection=target, draft_version=uuid.uuid4().hex)
+                    db.execute('UPDATE drafts SET payload=?,updated_at=? WHERE document_id=?',
+                               (json.dumps(payload, ensure_ascii=False), now(), row['document_id']))
+            db.execute('DELETE FROM collections WHERE name=?', (source,))
+
+    def remove_empty_collection(self, name):
+        with self.connect() as db:
+            if db.execute('SELECT 1 FROM documents WHERE collection=?', (name,)).fetchone():
+                raise ValueError('诗集仍含诗稿（包括回收站），请先归档到其他诗集。')
+            for row in db.execute('SELECT payload FROM drafts'):
+                if json.loads(row['payload']).get('collection') == name:
+                    raise ValueError('恢复草稿仍使用此诗集，请先处理草稿。')
+            db.execute('DELETE FROM collections WHERE name=?', (name,))
+
+    def storage_info(self):
+        exports = sorted((self.root / 'exports').glob('*.zip'), key=lambda p: p.stat().st_mtime, reverse=True)
+        backups = [p for p in exports if p.name.startswith('拾笺备份-')]
+        return {'export_bytes': sum(p.stat().st_size for p in exports),
+                'exports': [{'name': p.name, 'bytes': p.stat().st_size} for p in exports],
+                'last_backup': backups[0].name if backups else None,
+                'free_bytes': shutil.disk_usage(self.root).free, 'export_dir': str(self.root / 'exports')}
 
     def seed(self):
         for i, (title, author, era, text, collection, motif) in enumerate(POEMS):
@@ -169,7 +255,7 @@ class Library:
 
     @staticmethod
     def _get(db, doc_id):
-        row = db.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+        row = db.execute("SELECT d.*,COALESCE(v.revision,0) AS text_revision FROM documents d LEFT JOIN text_versions v ON v.document_id=d.id WHERE d.id=?", (doc_id,)).fetchone()
         if not row:
             raise KeyError("找不到这份诗稿")
         return dict(row)
@@ -201,6 +287,13 @@ class Library:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def change_token(self):
+        with self.connect() as db:
+            documents=tuple(db.execute('SELECT count(*),max(updated_at) FROM documents').fetchone())
+            collections=[row[0] for row in db.execute('SELECT name FROM collections ORDER BY name')]
+            settings=[tuple(row) for row in db.execute("SELECT key,value FROM settings WHERE key IN ('preferences','engine','pages_revision') ORDER BY key")]
+        return hashlib.sha256(json.dumps([documents,collections,settings],ensure_ascii=False).encode('utf-8')).hexdigest()
+
     def search(self, query):
         fields = ("title", "author", "era", "text", "notes", "filename", "collection")
         clause = " OR ".join(f"instr(casefold({field}), ?) > 0" for field in fields)
@@ -231,6 +324,8 @@ class Library:
             raise ValueError("不支持的字段")
         values["updated_at"] = now()
         with self.connect() as db:
+            if 'text' in values and self._get(db,doc_id)['text']!=values['text']:
+                self._bump_text(db,doc_id)
             db.execute(
                 "UPDATE documents SET " + ",".join(k + "=?" for k in values) + " WHERE id=?",
                 (*values.values(), doc_id),
@@ -313,6 +408,7 @@ class Library:
             )
             values.setdefault("reviewed", 0)
         if "text" in values:
+            if text!=old['text']:self._bump_text(db,doc_id)
             values["status"] = "done" if text.strip() else "new"
             values["error"] = ""
         if not text.strip():
@@ -485,10 +581,21 @@ class Library:
                         elif attempt.is_dir():
                             files.update(file for file in attempt.rglob("*") if file.is_file())
                 created_at = now()
+            required = snapshot.stat().st_size + sum(file.stat().st_size for file in files)
+            from archive_restore import MAX_BYTES, MAX_FILES
+            if required+20*1024**2>MAX_BYTES or len(files)+3>MAX_FILES:
+                raise ValueError('完整备份超过恢复上限（32 GiB、100000 个文件），请先整理已结束的识别结果副本。')
+            if shutil.disk_usage(self.root).free < required * 1.05 + 20 * 1024**2:
+                raise ValueError('诗库所在磁盘空间不足以生成完整备份，请先将已有导出副本移至其他磁盘。')
             # Originals, first-page previews, and completed attempts are immutable.
             # Lazy PDF page previews can be rebuilt and need not hold up the snapshot.
             with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
                 archive.write(snapshot, "library.sqlite3")
+                checksums = {}
+                for file in [snapshot, *sorted(files)]:
+                    name = 'library.sqlite3' if file == snapshot else file.relative_to(self.root).as_posix()
+                    with file.open('rb') as stream:
+                        checksums[name] = {'sha256': hashlib.file_digest(stream, 'sha256').hexdigest(), 'bytes': file.stat().st_size}
                 for file in sorted(files):
                     archive.write(file, file.relative_to(self.root).as_posix())
                 archive.writestr(
@@ -500,7 +607,8 @@ class Library:
                     json.dumps(
                         {
                             "app": "shijian",
-                            "version": 1,
+                            "version": 2,
+                            "files": checksums,
                             "created_at": created_at,
                             "skipped_active_results": skipped,
                         },

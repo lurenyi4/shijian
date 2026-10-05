@@ -17,6 +17,12 @@ const state = {
   collection: '',
   query: '',
   matches: null,
+  searching: false,
+  searchError: '',
+  lastSync: 0,
+  changeToken: '',
+  preferences: {},
+  pageNotes: null,
   filter: 'all',
   sort: 'newest',
   layout: 'grid',
@@ -79,6 +85,9 @@ async function refresh() {
     collections: data.collections,
     engine: data.engine,
     session: data.session,
+    preferences: data.preferences || {},
+    lastSync: Date.now(),
+    changeToken: data.change_token || '',
   });
   document.body.classList.toggle('large-text', Boolean(data.preferences?.large_text));
   const ids = new Set(state.documents.map((d) => d.id));
@@ -87,6 +96,12 @@ async function refresh() {
   await refreshSearch();
   if (!state.reader) renderLibrary();
   await refreshReader();
+  await refreshPageNotes();
+  if (state.editing) {
+    const latest = state.documents.find(d => d.id === state.reader.id);
+    if (latest && latest.updated_at !== state.reader.updated_at)
+      editorStatus('其他窗口已更新这份诗稿；当前输入保留，保存时会核对版本。');
+  }
 }
 
 async function refreshSearch() {
@@ -97,21 +112,32 @@ async function refreshSearch() {
     return;
   }
   const result = await api('/api/search?q=' + encodeURIComponent(query));
-  if (request === searchRequest && query === state.query) state.matches = new Set(result.ids);
+  if (request === searchRequest && query === state.query) {
+    state.matches = new Set(result.ids);
+    state.searching = false;
+    state.searchError = '';
+  }
 }
 
 function searchDocuments(query) {
   clearTimeout(searchTimer);
   searchRequest++;
   state.query = query.trim();
-  state.matches = null;
+  state.searching = Boolean(state.query);
+  state.searchError = '';
+  if (!state.query) state.matches = null;
   state.listPage = 1;
   renderLibrary();
   searchTimer = setTimeout(async () => {
+    const pending = searchRequest + 1;
     try {
       await refreshSearch();
       if (!state.reader) renderLibrary();
     } catch (e) {
+      if (searchRequest !== pending) return;
+      state.searching = false;
+      state.searchError = '搜索未完成，可重新搜索：' + e.message;
+      if (!state.reader) renderLibrary();
       toast(e.message);
     }
   }, 250);
@@ -138,6 +164,7 @@ async function pollTasks() {
   try {
     if (!ids.length) {
       await refreshReader();
+      if (Date.now() - state.lastSync > 15000) await syncChanges();
       return;
     }
     const data = await api('/api/tasks/status', { method: 'POST', body: { ids } });
@@ -152,8 +179,9 @@ async function pollTasks() {
       }
       return d;
     });
+    const phaseChanged = state.engine.phase !== data.engine.phase;
     state.engine = data.engine;
-    if (changed) {
+    if (changed || phaseChanged) {
       renderNav();
       await refreshSearch();
       if (!state.reader) renderLibrary();
@@ -163,6 +191,17 @@ async function pollTasks() {
   } finally {
     state.polling = false;
   }
+}
+async function syncChanges() {
+  const result = await api('/api/changes?since=' + encodeURIComponent(state.changeToken));
+  if (result.changed) await refresh();
+  else state.lastSync = Date.now();
+}
+async function refreshPageNotes() {
+  const reader = state.reader;
+  if (!reader || state.editing) return;
+  const notes = await api('/api/documents/' + reader.id + '/pages');
+  if (state.reader === reader && !state.editing) { state.pageNotes = notes; showPageNote(); }
 }
 function visibleDocs() {
   let docs = state.documents.filter((d) => (state.view === 'trash' ? d.trashed : !d.trashed));
@@ -175,7 +214,7 @@ function visibleDocs() {
       ['new', 'queued', 'running', 'failed', 'interrupted'].includes(d.status),
     );
   if (state.collection) docs = docs.filter((d) => d.collection === state.collection);
-  if (state.query) docs = docs.filter((d) => state.matches?.has(d.id));
+  if (state.query && state.matches !== null) docs = docs.filter((d) => state.matches.has(d.id));
   if (state.filter === 'new') docs = docs.filter((d) => d.status === 'new');
   if (state.filter === 'review') docs = docs.filter((d) => d.status === 'done' && !d.reviewed);
   if (state.filter === 'reviewed') docs = docs.filter((d) => d.reviewed);
@@ -240,6 +279,8 @@ function badge(doc) {
   return `<span class="badge ${esc(status)}">${status === 'reviewed' ? icon('check') : status === 'running' ? '<span class="busy-spinner"></span>' : ''}${label}</span>`;
 }
 function renderLibrary() {
+  const searchStatus = $('#search-status');
+  if (searchStatus) searchStatus.textContent = state.searching ? '正在搜索，暂时保留上次结果…' : state.searchError;
   const all = state.documents.filter((d) => !d.demo && !d.trashed),
     docs = visibleDocs();
   const pages = Math.max(1, Math.ceil(docs.length / PAGE_SIZE));
@@ -322,7 +363,7 @@ function renderLibrary() {
   const pending = all.filter((d) => ['running', 'queued'].includes(d.status));
   $('#queue-note').hidden = state.view !== 'queue';
   $('#queue-note').innerHTML =
-    `${pending.length ? `本机正在处理 ${pending.length} 份诗稿；首次运行可能需要下载模型。` : '选择待识别诗稿，开始本地识别。手写识别完成后均需校对。'}<button class="text-button" id="queue-action">${pending.length ? '停止全部任务' : '识别全部待处理'}</button>`;
+    `${pending.length ? `本机正在处理 ${pending.length} 份诗稿；${esc(state.engine.phase || '等待引擎')}。` : '选择待识别诗稿，开始本地识别。手写识别完成后均需校对。'}<button class="text-button" id="queue-action">${pending.length ? '停止全部任务' : '识别全部待处理'}</button>`;
   $('#queue-action').onclick = async () => {
     if (pending.length) {
       await api('/api/cancel', { method: 'POST', body: { ids: pending.map((d) => d.id) } });
@@ -360,6 +401,8 @@ function navigate(view, collection = '') {
   clearTimeout(searchTimer);
   searchRequest++;
   state.matches = null;
+  state.searching = false;
+  state.searchError = '';
   state.listPage = 1;
   state.view = view;
   state.collection = collection;
@@ -551,12 +594,22 @@ function showSettings() {
       $('#modal').close();
       toast(
         state.engine.available
-          ? '设置已保存，本地引擎已就绪'
+          ? '设置已保存；已找到程序，模型需通过实际识别验证'
           : '设置已保存；填写的程序路径暂时不可用',
       );
     } catch (e) {
       toast(e.message);
     }
+  };
+  $('#settings-form').insertAdjacentHTML('afterbegin', '<button type="button" id="engine-check" class="button secondary">检查已保存程序版本</button><p id="engine-diagnostic" role="status">程序可找到不代表模型已经准备完成。</p>');
+  $('#engine-check').onclick = async () => {
+    const button = $('#engine-check'); button.disabled = true;
+    const output = $('#engine-diagnostic'); output.textContent = '正在检查程序版本…';
+    try {
+      const result = await api('/api/engine/check', { method: 'POST' });
+      output.textContent = `${result.program_ok ? '版本检查完成' : '版本检查失败'}：${result.version_output}\n${result.models}`;
+    } catch (e) { output.textContent = e.message; }
+    finally { button.disabled = false; }
   };
 }
 function newCollection() {
@@ -586,6 +639,33 @@ function selectedIds() {
   }
   return [...state.selected];
 }
+async function updateSelection(ids, values) {
+  const succeeded = [], failed = [];
+  for (const id of ids) {
+    try {
+      await api('/api/documents/' + id, { method: 'PATCH', body: values });
+      succeeded.push(id);
+    } catch (e) { failed.push({ id, error: e.message }); }
+  }
+  state.selected = new Set(failed.map(item => item.id));
+  try { await refresh(); } catch (e) { toast('操作结果已记录，列表刷新失败：' + e.message); }
+  return { succeeded, failed };
+}
+function bindBatch(button, ids, values, label) {
+  button.onclick = async () => {
+    button.disabled = true;
+    button.textContent = '正在处理…';
+    const result = await updateSelection(ids, values);
+    if (!result.failed.length) {
+      $('#modal').close();
+      toast(`${label}：成功 ${result.succeeded.length} 份`);
+      return;
+    }
+    modal('部分操作未完成', `本次成功 ${result.succeeded.length} 份，失败 ${result.failed.length} 份。成功项不会重复处理。`,
+      `<div role="status">${result.failed.map(item => `<p>${esc(state.documents.find(d=>d.id===item.id)?.title || item.id)}：${esc(item.error)}</p>`).join('')}</div><button class="button primary" id="batch-retry">仅重试失败项</button>`);
+    bindBatch($('#batch-retry'), result.failed.map(item=>item.id), values, label);
+  };
+}
 function showMove() {
   const ids = selectedIds();
   if (!ids.length) return;
@@ -596,15 +676,8 @@ function showMove() {
   );
   $('#move-confirm').onclick = async () => {
     const collection = $('#move-to').value;
-    try {
-      for (const id of ids)
-        await api('/api/documents/' + id, { method: 'PATCH', body: { collection } });
-      $('#modal').close();
-      await refresh();
-      toast('诗稿已归入诗集');
-    } catch (e) {
-      toast(e.message);
-    }
+    bindBatch($('#move-confirm'), ids, { collection }, '诗稿已归入诗集');
+    await $('#move-confirm').onclick();
   };
 }
 async function trashSelected() {
@@ -616,18 +689,7 @@ async function trashSelected() {
     restoring ? '原图、文字与校对历史会一起恢复。' : '所有内容均会保留，之后可以在回收站恢复。',
     `<div class="modal-info">共 ${ids.length} 份诗稿。</div><div class="modal-actions"><button class="button secondary modal-close">返回</button><button class="button primary" id="trash-confirm">${restoring ? '恢复诗稿' : '移入回收站'}</button></div>`,
   );
-  $('#trash-confirm').onclick = async () => {
-    try {
-      for (const id of ids)
-        await api('/api/documents/' + id, { method: 'PATCH', body: { trashed: !restoring } });
-      state.selected.clear();
-      $('#modal').close();
-      await refresh();
-      toast(restoring ? '诗稿已恢复' : '已移入回收站');
-    } catch (e) {
-      toast(e.message);
-    }
-  };
+  bindBatch($('#trash-confirm'), ids, { trashed: !restoring }, restoring ? '诗稿已恢复' : '已移入回收站');
 }
 function download(url) {
   const a = document.createElement('a');
@@ -694,11 +756,13 @@ async function openReader(id) {
   const request = ++readerRequest;
   try {
     const doc = await api('/api/documents/' + id);
+    const notes = await api('/api/documents/' + id + '/pages');
     if (request !== readerRequest || state.editing) return;
     state.reader = doc;
+    state.pageNotes = notes;
     state.zoom = 1;
     state.rotation = 0;
-    state.page = 1;
+    state.page = Math.max(1, Math.min(doc.pages, notes.position || 1));
     $('#library-view').hidden = true;
     $('#reader-view').hidden = false;
     renderReader();
@@ -734,6 +798,9 @@ function renderReader() {
   $('#page-select').onchange = (e) => {
     state.page = Number(e.target.value);
     $('#scan-image').src = `/api/documents/${encodeURIComponent(d.id)}/image?page=${state.page}`;
+    showPageNote();
+    locatePageText();
+    api('/api/documents/' + d.id + '/position', {method:'PUT',body:{page:state.page}}).catch(e=>toast(e.message));
   };
   const applyZoom = () => {
     $('.scan-inner').style.width = `${state.zoom * 100}%`;
@@ -758,12 +825,15 @@ function renderReader() {
     if (!p) return;
     p.classList.toggle('vertical');
     $('#vertical-toggle').textContent = p.classList.contains('vertical') ? '横排' : '竖排';
+    savePreference({vertical:p.classList.contains('vertical')});
   };
   $('#text-larger').onclick = () => {
     const p = $('#poem-display');
     if (!p) return;
     let size = parseFloat(getComputedStyle(p).fontSize);
-    p.style.fontSize = (size >= 36 ? 20 : size + 4) + 'px';
+    const fontSize = size >= 36 ? 20 : Math.min(36, size + 4);
+    p.style.fontSize = fontSize + 'px';
+    savePreference({font_size:fontSize});
   };
   $('#copy-text').onclick = async () => {
     try {
@@ -793,6 +863,16 @@ function renderReader() {
       }
       recognize([d.id]);
     };
+  const poem = $('#poem-display');
+  poem.classList.toggle('vertical', Boolean(state.preferences.vertical));
+  $('#vertical-toggle').textContent = state.preferences.vertical ? '横排' : '竖排';
+  if (state.preferences.font_size) poem.style.fontSize = state.preferences.font_size + 'px';
+  $('.reader-bottom').insertAdjacentHTML('beforebegin', '<div class="page-workflow"><span id="page-note-status" role="status"></span><button class="button secondary" id="page-note-button">设置本页正文位置 / 校对状态</button></div>');
+  $('#page-note-button').onclick = editPageNote;
+  showPageNote();
+  api('/api/documents/' + d.id + '/pages').then(notes => {
+    if (state.reader === d && !state.editing) { state.pageNotes = notes; showPageNote(); }
+  }).catch(e=>toast('页级定位未刷新：'+e.message));
 }
 async function startEditing() {
   const original = state.reader;
@@ -819,6 +899,17 @@ async function startEditing() {
   $('#reader-text').innerHTML =
     `<div class="editor-fields"><input id="edit-title" aria-label="诗稿标题" value="${esc(d.title)}" maxlength="200"><input id="edit-author" aria-label="作者" placeholder="作者" value="${esc(d.author)}" maxlength="100"><select id="edit-collection" aria-label="诗集">${collectionOptions(d.collection)}</select><input id="edit-era" aria-label="年代" placeholder="年代 / 写作年份" value="${esc(d.era)}" maxlength="100"></div><textarea class="editor-text" id="edit-text" aria-label="诗词正文" spellcheck="false">${esc(d.text)}</textarea><textarea class="editor-notes" id="edit-notes" aria-label="札记" placeholder="札记：写作时间、字迹疑问，或这首诗的故事…">${esc(d.notes)}</textarea><div class="editor-actions"><button class="button secondary" id="edit-cancel">取消</button><button class="button secondary" id="edit-save">保存草稿</button><button class="button primary" id="edit-reviewed">${icon('check')}保存并完成校对</button></div>`;
   $('#edit-cancel').textContent = '退出校对（保留草稿）';
+  if (state.preferences.font_size) $('#edit-text').style.fontSize = state.preferences.font_size + 'px';
+  $('.editor-actions').insertAdjacentHTML('beforebegin', '<p id="editor-status" role="status" aria-live="polite">编辑内容会保存为恢复草稿，正文需点击保存。</p>');
+  $('.editor-actions').insertAdjacentHTML('beforeend', '<button class="button secondary" id="edit-next">完成并校对下一份</button>');
+  $('#edit-next').onclick = async () => {
+    const current = state.reader.id;
+    await saveEdit(true);
+    if (state.editing) return;
+    const next = state.documents.find(item => item.id !== current && !item.demo && !item.trashed && item.status === 'done' && !item.reviewed);
+    if (next) { await openReader(next.id); if (state.reader?.id === next.id) await startEditing(); }
+    else toast('当前没有其他待校对诗稿。');
+  };
   $('#edit-cancel').onclick = async () => {
     if (state.saving) return;
     setEditorSaving(true);
@@ -846,6 +937,8 @@ function editorValues() {
   };
 }
 function scheduleRecoveryDraft() {
+  editorStatus('正在编辑，等待保存恢复草稿…');
+  showPageNote();
   if (draftTimer !== null || state.saving) return;
   draftTimer = setTimeout(() => {
     draftTimer = null;
@@ -864,13 +957,19 @@ function persistRecoveryDraft(force = false) {
         method: 'PUT', body: { ...body, draft_version: state.draftVersion },
       });
       state.draftVersion = saved.draft_version;
+      editorStatus('恢复草稿已保存；正文尚未提交。');
       return true;
     } catch (e) {
+      editorStatus('恢复草稿未保存：' + e.message);
       toast('恢复草稿尚未保存，请保留窗口并重试：' + e.message);
       return false;
     }
   });
   return draftPending;
+}
+function editorStatus(message) {
+  const status = $('#editor-status');
+  if (status) status.textContent = message;
 }
 async function saveEdit(reviewed) {
   if (!state.editing || state.saving) return;
@@ -930,8 +1029,12 @@ async function showHistory() {
     toast('请先保存本次校对。');
     return;
   }
-  const id = state.reader.id,
+  const reader = state.reader;
+  const id = reader.id,
     history = await api('/api/documents/' + id + '/revisions');
+  if (state.reader !== reader || state.editing) return;
+  const expected = reader.updated_at;
+  const currentText = reader.text;
   modal(
     '字句之间，有迹可循。',
     '恢复旧版本前，当前版本也会保存到历史。',
@@ -948,27 +1051,134 @@ async function showHistory() {
     (b) =>
       (b.onclick = async () => {
         const h = history.find((h) => h.id === Number(b.dataset.restore));
-        try {
-          state.reader = await api('/api/documents/' + id, {
-            method: 'PATCH',
-            body: {
-              title: h.title,
-              author: h.author,
-              era: h.era,
-              text: h.text,
-              notes: h.notes,
-              reviewed: false,
-            },
-          });
-          $('#modal').close();
-          await refresh();
-          renderReader();
-          toast('已恢复旧版本，请重新确认校对');
-        } catch (e) {
-          toast(e.message);
-        }
+        modal('核对恢复内容', '恢复前会检查正文版本；当前正文仍保留在历史中。',
+          `<div class="revision-compare"><section><h3>当前正文</h3><pre>${esc(currentText)}</pre></section><section><h3>将恢复的正文</h3><pre>${esc(h.text)}</pre></section></div><button id="restore-confirm" class="button primary">确认恢复</button>`);
+        $('#restore-confirm').onclick = async () => {
+          $('#restore-confirm').disabled = true;
+          await restoreRevision(id, h, expected);
+          if ($('#restore-confirm')) $('#restore-confirm').disabled = false;
+        };
       }),
   );
+}
+async function restoreRevision(id, h, expected) {
+  try {
+    const saved = await api('/api/documents/' + id, { method: 'PATCH', body: {
+      title: h.title, author: h.author, era: h.era, text: h.text, notes: h.notes,
+      reviewed: false, expected_updated_at: expected,
+    } });
+    if (state.reader?.id === id) state.reader = saved;
+    $('#modal').close();
+    renderReader();
+    toast('已恢复旧版本，请重新确认校对');
+    try { await refresh(); } catch { toast('已恢复，列表暂时无法刷新。'); }
+  } catch (e) { toast(e.message); }
+}
+let preferencePending = Promise.resolve();
+function savePreference(values) {
+  Object.assign(state.preferences, values);
+  preferencePending = preferencePending.then(() => api('/api/preferences', {method:'PUT',body:values}))
+    .catch(e => toast('阅读偏好尚未保存：' + e.message));
+  return preferencePending;
+}
+function showPageNote() {
+  const status = $('#page-note-status');
+  if (!status) return;
+  if (state.pageNotes && state.pageNotes.text_revision !== state.reader?.text_revision) {
+    status.textContent = '正文版本已变化，请重新打开并确认本页定位。';
+    return;
+  }
+  if (state.editing && $('#edit-text')?.value !== state.reader.text) {
+    status.textContent = '正文编辑中，保存后需重新确认本页定位与校对状态。';
+    return;
+  }
+  const note = state.pageNotes?.pages.find(item=>item.page===state.page);
+  status.textContent = !note ? '本页尚未关联正文起始行。' : note.stale ? '正文已变化，本页定位与校对状态需重新确认。' : `第 ${state.page} 页 → 正文第 ${note.start_line} 行 · ${note.reviewed ? '本页已核对' : '本页待核对'}`;
+}
+function locatePageText() {
+  const note = state.pageNotes?.pages.find(item=>item.page===state.page && !item.stale);
+  if (!note) return;
+  const content = state.reader.text;
+  const offset = content.split('\n').slice(0,note.start_line-1).reduce((n,line)=>n+line.length+1,0);
+  if (state.editing) {
+    const editor = $('#edit-text');
+    if (editor.value !== content) { toast('正文尚有修改，保存后再按分页定位。'); return; }
+    editor.focus();editor.setSelectionRange(offset,offset);
+    editor.scrollTop = (note.start_line-1)*parseFloat(getComputedStyle(editor).lineHeight);
+  } else {
+    const poem = $('#poem-display');
+    if (!poem.firstChild) return;
+    const range = document.createRange();
+    range.setStart(poem.firstChild,Math.min(offset,poem.firstChild.length));range.collapse(true);
+    const box = range.getBoundingClientRect(), viewport = $('#reader-text');
+    viewport.scrollTop += box.top - viewport.getBoundingClientRect().top - 24;
+  }
+}
+async function editPageNote() {
+  if (state.editing) { toast('请先保存正文，再设置页级定位。'); return; }
+  const doc = state.reader, page = state.page;
+  try {
+    const notes = await api('/api/documents/' + doc.id + '/pages');
+    if (state.reader !== doc) return;
+    if (notes.text_revision !== doc.text_revision) {
+      toast('正文已更新，请重新打开诗稿，核对当前正文后设置页级定位。');
+      return;
+    }
+    state.pageNotes = notes;
+    const old = notes.pages.find(item=>item.page===page);
+    modal(`第 ${page} 页正文定位`, '按原稿确认正文起始行。正文变化后需重新核对；页级标记不会自动完成整份校对。',
+      `<label class="field">正文起始行（1–${doc.text.split('\n').length}）<input id="anchor-line" type="number" min="1" max="${doc.text.split('\n').length}" value="${old?.start_line || 1}"></label><label><input id="anchor-reviewed" type="checkbox" ${old?.reviewed && !old.stale ? 'checked' : ''}>已人工核对本页</label><pre class="numbered-text">${doc.text.split('\n').map((line,i)=>`${i+1}　${esc(line)}`).join('\n')}</pre><button id="anchor-save" class="button primary">保存定位</button>`);
+    $('#anchor-save').onclick = async () => {
+      try {
+        state.pageNotes = await api('/api/documents/' + doc.id + '/pages', {method:'PUT',body:{page,start_line:Number($('#anchor-line').value),reviewed:$('#anchor-reviewed').checked,text_version:notes.text_version}});
+        $('#modal').close();showPageNote();locatePageText();
+      } catch(e) { toast(e.message); }
+    };
+  } catch(e) { toast(e.message); }
+}
+async function manageCollections() {
+  modal('管理诗集', '重命名为已有诗集会合并归档，回收站和恢复草稿一起更新。仅能移除没有诗稿或草稿的空诗集。',
+    `<label class="field">原诗集<select id="collection-source">${collectionOptions()}</select></label><label class="field">新名称 / 合并到<input id="collection-target" maxlength="100"></label><button class="button primary" id="collection-rename">重命名 / 合并</button><button class="button secondary" id="collection-empty">移除空诗集</button>`);
+  const change = async target => {
+    try {
+      await api('/api/collections', {method:'PUT',body:{source:$('#collection-source').value,target}});
+      $('#modal').close();navigate('library');await refresh();toast('诗集已更新');
+    } catch(e) { toast(e.message); }
+  };
+  $('#collection-rename').onclick = () => change($('#collection-target').value.trim());
+  $('#collection-empty').onclick = () => change(null);
+}
+async function showRestore() {
+  try {
+    const info = await api('/api/storage');
+    modal('恢复与备份管理', '只恢复到新目录，当前诗库保持不变。备份生成后仍需复制到另一块硬盘。',
+      `<p>最近备份：${esc(info.last_backup || '尚无备份')}<br>导出副本占用 ${(info.export_bytes/1024**2).toFixed(1)} MiB；磁盘剩余 ${(info.free_bytes/1024**3).toFixed(1)} GiB</p><button class="button secondary" id="open-exports">打开导出目录，选择要保留的副本</button><p class="data-path">${esc(info.export_dir)}</p><label class="field">备份 ZIP 的完整路径<input id="restore-source"></label><label class="field">恢复到新的完整目录<input id="restore-destination" placeholder="例如 D:\\家藏诗库恢复副本"></label><button class="button secondary" id="restore-check">校验备份</button><button class="button primary" id="restore-run" disabled>恢复副本</button><p id="restore-status" role="status"></p>`);
+    $('#open-exports').onclick = () => api('/api/storage/open-exports',{method:'POST'}).catch(e=>toast(e.message));
+    let checkedSource = '';
+    $('#restore-source').oninput = () => { checkedSource='';$('#restore-run').disabled=true; };
+    $('#restore-check').onclick = async () => {
+      const source = $('#restore-source').value.trim(), output = $('#restore-status');
+      $('#restore-check').disabled=true;$('#restore-run').disabled=true;output.textContent='正在校验全部文件…';
+      try {
+        const result=await api('/api/restore/check',{method:'POST',body:{source}});
+        if ($('#restore-source').value.trim() !== source) return;
+        checkedSource=source;$('#restore-run').disabled=false;
+        output.textContent=`${result.files} 个文件，解压后 ${(result.bytes/1024**3).toFixed(2)} GiB。${result.verified?'文件哈希校验通过。':'旧版备份没有哈希清单，仅通过压缩包检查。'} ${result.skipped_tasks} 个活动识别目录未包含在备份中。`;
+      } catch(e) { output.textContent=e.message; }
+      finally { if($('#restore-check')) $('#restore-check').disabled=false; }
+    };
+    $('#restore-run').onclick = async () => {
+      if(!checkedSource || checkedSource!==$('#restore-source').value.trim())return;
+      const destination=$('#restore-destination').value.trim(), output=$('#restore-status');
+      $('#restore-run').disabled=true;output.textContent='正在再次校验并恢复副本…';
+      try {
+        const result=await api('/api/restore',{method:'POST',body:{source:checkedSource,destination}});
+        output.textContent='恢复完成：'+result.destination;
+        output.insertAdjacentHTML('afterend','<button class="button primary" id="open-restored">打开已恢复副本</button>');
+        $('#open-restored').onclick=()=>api('/api/restore/open',{method:'POST',body:{source:checkedSource,destination:result.destination}}).catch(e=>toast(e.message));
+      } catch(e) {output.textContent=e.message;$('#restore-run').disabled=false;}
+    };
+  } catch(e) {toast(e.message);}
 }
 // Bind all public controls; errors are also surfaced for keyboard-triggered promises.
 $$('.import-trigger').forEach((b) => (b.onclick = showImport));
@@ -992,6 +1202,8 @@ $('#art-sources').onclick = async () => {
 };
 $('#settings-button').onclick = showSettings;
 $('#new-collection').onclick = newCollection;
+$('#manage-collections').onclick = manageCollections;
+$('#restore-button').onclick = showRestore;
 $('#backup-button').onclick = backup;
 $('#search').oninput = (e) => searchDocuments(e.target.value);
 $('#status-filter').onchange = (e) => {
@@ -1091,6 +1303,9 @@ window.addEventListener('beforeunload', (e) => {
     e.preventDefault();
     e.returnValue = '';
   }
+});
+window.addEventListener('focus', () => {
+  if (!state.importing && !state.saving) syncChanges().catch(e => toast('同步未完成：' + e.message));
 });
 window.addEventListener('unhandledrejection', (e) => {
   console.error(e.reason);

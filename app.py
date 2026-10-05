@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import secrets
 import uuid
+import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from engine import LocalEngine
 from storage import Library, MAX_FILE, default_data_dir
+from archive_restore import inspect_backup, restore_backup
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -47,7 +51,30 @@ class Draft(BaseModel):
 
 
 class Preferences(BaseModel):
-    large_text: bool = False
+    large_text: bool | None = None
+    vertical: bool | None = None
+    font_size: int | None = Field(None, ge=20, le=36)
+
+
+class PageNote(BaseModel):
+    page: int = Field(ge=1, le=600)
+    start_line: int = Field(ge=1)
+    reviewed: bool = False
+    text_version: str = Field(min_length=64, max_length=64)
+
+
+class Position(BaseModel):
+    page: int = Field(ge=1, le=600)
+
+
+class CollectionChange(BaseModel):
+    source: str = Field(min_length=1, max_length=100)
+    target: str | None = Field(None, min_length=1, max_length=100)
+
+
+class Restore(BaseModel):
+    source: str = Field(min_length=1, max_length=2000)
+    destination: str = Field('', max_length=2000)
 
 
 class Export(Selection):
@@ -64,6 +91,7 @@ def create_app(data_dir=None, seed=True, run_worker=True):
     library = Library(Path(data_dir) if data_dir else default_data_dir(), seed=seed)
     engine = LocalEngine(library)
     session = secrets.token_urlsafe(32)
+    restored_copies = set()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -113,18 +141,25 @@ def create_app(data_dir=None, seed=True, run_worker=True):
 
     @app.get("/api/state")
     def state():
-        summaries = library.summaries()
-        with library.connect() as db:
-            collections = [
-                r["name"] for r in db.execute("SELECT name FROM collections ORDER BY name")
-            ]
+        with library.lock:
+            summaries = library.summaries()
+            with library.connect() as db:
+                collections = [r["name"] for r in db.execute("SELECT name FROM collections ORDER BY name")]
+            preferences=library.setting("preferences", {"large_text": False})
+            token=library.change_token()
         return {
             "documents": summaries,
             "collections": collections,
             "engine": engine.info(),
             "session": session,
-            "preferences": library.setting("preferences", {"large_text": False}),
+            "preferences": preferences,
+            "change_token": token,
         }
+
+    @app.get('/api/changes')
+    def changes(since: str = Query('', max_length=64)):
+        token=library.change_token()
+        return {'changed': token!=since, 'change_token': token}
 
     @app.get("/api/search")
     def search(q: str = Query(min_length=1, max_length=500)):
@@ -157,9 +192,30 @@ def create_app(data_dir=None, seed=True, run_worker=True):
 
     @app.put("/api/preferences")
     def preferences(payload: Preferences):
-        values = payload.model_dump()
-        library.set_setting("preferences", values)
-        return values
+        return library.preferences(payload.model_dump(exclude_none=True))
+
+    @app.get('/api/documents/{doc_id}/pages')
+    def pages(doc_id: str):
+        return library.page_notes(doc_id)
+
+    @app.put('/api/documents/{doc_id}/pages')
+    def save_page(doc_id: str, payload: PageNote):
+        return library.save_page_note(doc_id, **payload.model_dump())
+
+    @app.put('/api/documents/{doc_id}/position')
+    def save_position(doc_id: str, payload: Position):
+        if payload.page > library.get(doc_id)['pages']:
+            raise ValueError('页码超出原稿范围。')
+        library.set_setting('position:' + doc_id, payload.page)
+        return {'page': payload.page}
+
+    @app.put('/api/collections')
+    def change_collection(payload: CollectionChange):
+        if payload.target is None:
+            library.remove_empty_collection(payload.source)
+        else:
+            library.rename_collection(payload.source, payload.target)
+        return {'ok': True}
 
     @app.get("/api/documents/{doc_id}/revisions")
     def revisions(doc_id: str):
@@ -225,6 +281,10 @@ def create_app(data_dir=None, seed=True, run_worker=True):
         library.set_setting("engine", config)
         return engine.info()
 
+    @app.post('/api/engine/check')
+    def engine_check():
+        return engine.diagnose()
+
     @app.post("/api/recognize")
     def recognize(payload: Selection):
         return {"accepted": engine.enqueue(payload.ids, payload.force)}
@@ -243,6 +303,41 @@ def create_app(data_dir=None, seed=True, run_worker=True):
     def backup():
         path = library.backup()
         return {"url": "/api/download/" + path.name, "filename": path.name}
+
+    @app.get('/api/storage')
+    def storage_info():
+        return library.storage_info()
+
+    @app.post('/api/storage/open-exports')
+    def open_exports():
+        if os.name != 'nt':
+            raise ValueError('请在文件管理器中打开：' + str(library.root / 'exports'))
+        os.startfile(library.root / 'exports')
+        return {'ok': True}
+
+    @app.post('/api/restore/check')
+    def check_restore(payload: Restore):
+        return inspect_backup(Path(payload.source).expanduser())
+
+    @app.post('/api/restore')
+    def restore(payload: Restore):
+        if not payload.destination:
+            raise ValueError('请填写恢复副本的新目录。')
+        destination = restore_backup(Path(payload.source).expanduser(), payload.destination)
+        restored_copies.add(str(destination))
+        return {'destination': str(destination)}
+
+    @app.post('/api/restore/open')
+    def open_restored(payload: Restore):
+        destination = str(Path(payload.destination).resolve())
+        if destination not in restored_copies:
+            raise ValueError('只能打开本次已经校验恢复的副本。')
+        command = [sys.executable]
+        if not getattr(sys, 'frozen', False):
+            command.append(str(Path(__file__).with_name('desktop.py')))
+        command += ['--data-dir', destination]
+        subprocess.Popen(command, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        return {'ok': True}
 
     @app.get("/api/download/{filename}")
     def download(filename: str):

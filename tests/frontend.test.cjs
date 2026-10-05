@@ -76,6 +76,66 @@ function prepareEditor(h) {
          globalThis.renderCount=0;renderReader=()=>renderCount++;refresh=async()=>{};`);
 }
 
+test('idle polling discovers edits from another window', async () => {
+  const h = harness();
+  h.run(`state.reader={id:'one',status:'done',text:'old',updated_at:'1'};
+    state.documents=[{...state.reader}];globalThis.syncs=0;
+    api=async()=>({changed:true});
+    refresh=async()=>{syncs++;};`);
+  await h.run('pollTasks()');
+  assert.equal(h.run('syncs'), 1);
+});
+
+test('search keeps previous matches while the next request is pending', () => {
+  const h = harness();
+  h.run(`state.documents=[{id:'one',created_at:'1'}];state.matches=new Set(['one']);
+    renderLibrary=()=>{};searchDocuments('new query');`);
+  assert.equal(h.run('visibleDocs().length'), 1);
+  assert.equal(h.run('state.searching'), true);
+});
+
+test('batch updates continue after failure and retry only failed items', async () => {
+  const h = harness();
+  h.run(`globalThis.calls=[];globalThis.refreshes=0;
+    api=async u=>{calls.push(u);if(u.endsWith('/b'))throw Error('sample failure');};
+    refresh=async()=>{refreshes++};`);
+  const result = await h.run("updateSelection(['a','b','c'],{collection:'诗集'})");
+  assert.deepEqual(Array.from(result.succeeded), ['a','c']);
+  assert.deepEqual(Array.from(result.failed, x=>x.id), ['b']);
+  assert.equal(h.run('refreshes'), 1);
+  assert.deepEqual(Array.from(h.run('state.selected')), ['b']);
+});
+
+test('history replacement carries the version seen before confirmation', async () => {
+  const h = harness();
+  h.run(`state.reader={id:'one',updated_at:'1'};globalThis.sent=null;
+    api=async(u,o)=>{sent=o.body;throw Error('version conflict');};`);
+  await h.run("restoreRevision('one',{title:'old',text:'old'},'1')");
+  assert.equal(h.run('sent.expected_updated_at'), '1');
+  assert.equal(h.run('state.reader.updated_at'), '1');
+});
+
+test('page confirmation rejects a version different from the displayed text', async () => {
+  const h = harness();
+  h.run(`state.reader={id:'one',text:'旧正文',text_revision:1};
+    api=async()=>({text_revision:2,text_version:'new',pages:[]});
+    modal=()=>{throw Error('must not show stale text with new version')};`);
+  await h.run('editPageNote()');
+  assert.match(h.run('messages.at(-1)'), /正文已更新/);
+});
+
+test('sync updates page confirmation even when body has not changed', async () => {
+  const h = harness();
+  h.run(`state.reader={id:'one',text:'same',text_revision:1,updated_at:'1'};
+    state.documents=[{...state.reader}];renderNav=()=>{};renderLibrary=()=>{};
+    api=async u=>u==='/api/state'
+      ?{documents:[{id:'one',updated_at:'1'}],collections:[],engine:{},session:'s'}
+      :{text_revision:1,pages:[{page:1,start_line:1,reviewed:1,stale:false}]};`);
+  await h.run('refresh()');
+  assert.equal(h.run('state.pageNotes.pages[0].reviewed'),1);
+  assert.equal(h.run('state.reader.text'),'same');
+});
+
 test('saving locks input, rejects duplicate submissions, and saves the displayed draft', async () => {
   const h = harness();
   prepareEditor(h);
@@ -197,7 +257,7 @@ test('a detail response never replaces a draft started while the request was in 
 
 test('detail refresh is retried after the last task has finished', async () => {
   const h = harness();
-  h.run(`state.reader={id:'one',status:'running',updated_at:'1'};
+  h.run(`state.lastSync=Date.now();state.reader={id:'one',status:'running',updated_at:'1'};
     state.documents=[{id:'one',status:'done',updated_at:'2'}];
     renderReader=()=>{};
     api=async()=>({id:'one',status:'done',text:'完成',updated_at:'2'});`);
